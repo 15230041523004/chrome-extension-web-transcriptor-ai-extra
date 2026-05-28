@@ -41,10 +41,17 @@ jobs:
             exit 1
           fi
 
+      - name: Generate tag name
+        id: tag
+        run: |
+          TAG="v$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Generated tag: $TAG"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v$(date +%Y%m%d)-$(git rev-parse --short HEAD)
-          name: Release $(date +%Y-%m-%d)
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
           files: chrome-extension.zip
           generate_release_notes: true
