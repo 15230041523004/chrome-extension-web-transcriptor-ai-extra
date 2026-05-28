@@ -32,9 +32,9 @@ export const Offscreen: React.FC = () => {
 		const includeMicrophone = transcriptionSettings.includeMicrophone ?? false;
 
 		try {
-			// @ts-ignore - Chrome specific tab capture API (mandatory is not in standard types)
 			const tabStream = await navigator.mediaDevices.getUserMedia({
 				audio: {
+					// @ts-ignore - Chrome specific tab capture API (mandatory is not in standard types)
 					mandatory: {
 						chromeMediaSource: "tab",
 						chromeMediaSourceId: streamId,
