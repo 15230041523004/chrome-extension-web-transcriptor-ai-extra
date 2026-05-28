@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-      - name: Generate tag name
+      - name: Generate release tag
         id: tag
         run: |
           TAG="v$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
@@ -53,5 +53,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
-          files: chrome-extension.zip
+          files: chrome-extension-web-transcriptor-ai-extra.zip
           generate_release_notes: true
+          draft: false
+          prerelease: false
