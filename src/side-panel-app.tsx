@@ -99,7 +99,7 @@ const SidePanelApp: React.FC = () => {
 		}
 	};
 
-	// Simple auto model selection
+	// Auto model selection logic (used when user chooses Auto)
 	const getRecommendedModel = (): WhisperModel => {
 		if (typeof navigator !== "undefined" && (navigator as any).gpu) {
 			return "base";
@@ -108,9 +108,13 @@ const SidePanelApp: React.FC = () => {
 	};
 
 	const handleModelChange = (newModel: WhisperModel) => {
+		let finalModel = newModel;
+		if (newModel === "auto") {
+			finalModel = getRecommendedModel();
+		}
 		setTranscriptionSettings((prev) => ({
 			...prev,
-			whisperModel: newModel,
+			whisperModel: finalModel,
 		}));
 	};
 
@@ -150,7 +154,7 @@ const SidePanelApp: React.FC = () => {
 									onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "translate" }))}
 								/>
 								<span className="text-sm">Translate</span>
-							</label>
+						</label>
 						</div>
 					</div>
 
@@ -167,7 +171,7 @@ const SidePanelApp: React.FC = () => {
 						</div>
 					)}
 
-					{/* NEW: AI Model Selector */}
+					{/* AI Model Selector */}
 					<div className="mb-3">
 						<span className="text-sm font-medium block mb-1">AI Model</span>
 						<select
