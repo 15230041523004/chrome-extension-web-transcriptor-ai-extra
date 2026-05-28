@@ -34,10 +34,10 @@ jobs:
         run: |
           if [ -d "dist" ]; then
             cd dist
-            zip -r ../chrome-extension.zip ./*
+            zip -r ../chrome-extension.zip ./
             echo "✅ ZIP created successfully"
           else
-            echo "❌ dist folder not found after build!"
+            echo "❌ dist folder not found!"
             exit 1
           fi
 
