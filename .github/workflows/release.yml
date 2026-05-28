@@ -27,37 +27,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Check & Fix code
-        run: npm run check -- --fix
-
-      - name: Bump version (patch)
-        run: |
-          CURRENT=$(jq -r '.version' public/manifest.json)
-          NEW_VERSION=$(echo $CURRENT | awk -F. '{print $1"."$2"."$3+1}')
-          jq --arg v "$NEW_VERSION" '.version = $v' public/manifest.json > tmp.json
-          mv tmp.json public/manifest.json
-          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
-
       - name: Build extension
         run: npm run build
 
       - name: Create ZIP
         run: |
-          cd dist
-          zip -r ../chrome-extension-v${{ env.NEW_VERSION }}.zip ./*
+          if [ -d "dist" ]; then
+            cd dist
+            zip -r ../chrome-extension.zip ./*
+            echo "✅ ZIP created successfully"
+          else
+            echo "❌ dist folder not found after build!"
+            exit 1
+          fi
 
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public/manifest.json
-          git commit -m "chore: bump version to ${{ env.NEW_VERSION }}" || echo "No changes to commit"
-          git push
-
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.NEW_VERSION }}
-          name: Release v${{ env.NEW_VERSION }}
-          files: chrome-extension-v${{ env.NEW_VERSION }}.zip
+          tag_name: v$(date +%Y%m%d)-$(git rev-parse --short HEAD)
+          name: Release $(date +%Y-%m-%d)
+          files: chrome-extension.zip
           generate_release_notes: true
