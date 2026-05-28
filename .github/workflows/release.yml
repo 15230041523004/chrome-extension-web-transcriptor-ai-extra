@@ -30,13 +30,16 @@ jobs:
       - name: Build extension
         run: npm run build
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Release ${{ steps.tag.outputs.tag }}
-          files: chrome-extension-web-transcriptor-ai-extra.zip
-          generate_release_notes: true
+      - name: Create ZIP
+        run: |
+          if [ -d "dist" ]; then
+            cd dist
+            zip -r ../chrome-extension-web-transcriptor-ai-extra.zip ./
+            echo "✅ ZIP created: chrome-extension-web-transcriptor-ai-extra.zip"
+          else
+            echo "❌ dist folder not found after build!"
+            exit 1
+          fi
 
       - name: Generate tag name
         id: tag
