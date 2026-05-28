@@ -37,7 +37,7 @@ jobs:
             zip -r ../chrome-extension.zip ./
             echo "✅ ZIP created successfully"
           else
-            echo "❌ dist folder not found!"
+            echo "❌ dist folder not found after build!"
             exit 1
           fi
 
