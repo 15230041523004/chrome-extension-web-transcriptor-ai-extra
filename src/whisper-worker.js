@@ -22,9 +22,9 @@ class AutomaticSpeechRecognitionPipeline {
 	static model = null;
 
 	static async getInstance(progress_callback = null) {
-		// Using whisper-small for reliable loading + good Russian quality
-		// (medium was too heavy for extension WebGPU context and caused 'error')
-		this.model_id = "onnx-community/whisper-small";
+		// Using whisper-base for maximum WebGPU compatibility + reliable Russian support
+		// (small and medium were causing FILTER_IN_CHANNEL / Conv kernel errors on some GPUs)
+		this.model_id = "onnx-community/whisper-base";
 
 		AutomaticSpeechRecognitionPipeline;
 		AutomaticSpeechRecognitionPipeline.tokenizer ??=
@@ -38,10 +38,7 @@ class AutomaticSpeechRecognitionPipeline {
 		this.model ??= WhisperForConditionalGeneration.from_pretrained(
 			this.model_id,
 			{
-				dtype: {
-					encoder_model: "fp16",
-					decoder_model_merged: "q4",
-				},
+				dtype: "fp32",           // safest for WebGPU compatibility
 				device: "webgpu",
 				progress_callback,
 			},
