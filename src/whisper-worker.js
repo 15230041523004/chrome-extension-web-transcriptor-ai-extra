@@ -8,7 +8,7 @@ import {
 	full,
 } from "@huggingface/transformers";
 
-const MAX_NEW_TOKENS = 64;
+const MAX_NEW_TOKENS = 128;
 
 /**
  * This class uses the Singleton pattern to ensure that only one instance of the model is loaded.
@@ -22,42 +22,35 @@ class AutomaticSpeechRecognitionPipeline {
 	static model = null;
 
 	static async getInstance(progress_callback = null) {
-		// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
-		this.model_id = "onnx-community/whisper-large-v3-turbo";
-		// this.model_id = "onnx-community/whisper-base";
+		// Changed to medium for better Russian support
+		this.model_id = "onnx-community/whisper-medium";
 
 		AutomaticSpeechRecognitionPipeline;
 		AutomaticSpeechRecognitionPipeline.tokenizer ??=
-			// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
 			AutoTokenizer.from_pretrained(this.model_id, {
 				progress_callback,
 			});
-		// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
 		this.processor ??= AutoProcessor.from_pretrained(this.model_id, {
 			progress_callback,
 		});
 
-		// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
 		this.model ??= WhisperForConditionalGeneration.from_pretrained(
-			// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
 			this.model_id,
 			{
 				dtype: {
-					encoder_model: "fp16", // 'fp16' works too
-					decoder_model_merged: "q4", // or 'fp32' ('fp16' is broken)
+					encoder_model: "fp16",
+					decoder_model_merged: "q4",
 				},
 				device: "webgpu",
 				progress_callback,
 			},
 		);
-		// biome-ignore lint/complexity/noThisInStatic: static class with shared state for model loading
 		return Promise.all([this.tokenizer, this.processor, this.model]);
 	}
 }
 
 /**
  * Convert UI language format to Whisper format.
- * UI uses compound names (e.g. "spanish/castilian") but Whisper expects single names (e.g. "spanish").
  */
 function toWhisperLanguage(language) {
 	if (!language || typeof language !== "string") return language;
@@ -66,13 +59,7 @@ function toWhisperLanguage(language) {
 
 let processing = false;
 
-/**
- * Process audio with Whisper.
- * @param {Float32Array} audio - Audio samples
- * @param {string|null} language - Source language (null = auto-detect). For translate, this is the source language hint.
- * @param {"transcribe"|"translate"} task - Whisper task. transcribe=output in same language, translate=output in English
- */
-export async function processWhisperMessage(audio, language, task) {
+export async function processWhisperMessage(audio, language, task = "transcribe") {
 	if (processing) return;
 	processing = true;
 	if (!audio) {
@@ -80,19 +67,12 @@ export async function processWhisperMessage(audio, language, task) {
 		processing = false;
 		return;
 	}
+
 	const whisperLanguage = language ? toWhisperLanguage(language) : null;
-	console.debug("processWhisperMessage", audio, whisperLanguage, task);
-	// const audioF32 = new Float32Array(audio);
-	// console.debug("audio", audioF32);
+	console.debug("processWhisperMessage → task:", task, "language:", whisperLanguage);
 
-	// Tell the main thread we are starting
-	// self.postMessage({ status: "start" });
-
-	// Retrieve the text-generation pipeline.
 	const [tokenizer, processor, model] =
 		await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
-			// We also add a progress callback to the pipeline so that we can
-			// track model loading.
 			if (
 				data.status === "progress" &&
 				Math.ceil(data.progress * 100) % 10 === 0
@@ -100,74 +80,45 @@ export async function processWhisperMessage(audio, language, task) {
 				console.debug(`Model loading: ${data.progress}%`);
 				chrome.runtime.sendMessage({ type: "whisper-progress", data });
 			}
-			// self.postMessage(data);
 		});
-
-	let startTime;
-	let numTokens = 0;
-	const callback_function = (output) => {
-		startTime ??= performance.now();
-
-		let _tps;
-		if (numTokens++ > 0) {
-			_tps = (numTokens / (performance.now() - startTime)) * 1000;
-		}
-		console.debug("callback_func/output", output);
-		// self.postMessage({
-		//   status: "update",
-		//   output,
-		//   tps,
-		//   numTokens,
-		// });
-	};
 
 	const streamer = new TextStreamer(tokenizer, {
 		skip_prompt: true,
 		skip_special_tokens: true,
-		callback_function,
 	});
 
 	const inputs = await processor(audio);
 
-	const effectiveTask = task || "transcribe";
-	console.debug("Whisper task:", effectiveTask, "language:", whisperLanguage);
-
 	const outputs = await model.generate({
 		...inputs,
 		max_new_tokens: MAX_NEW_TOKENS,
-		task: effectiveTask,
-		language: whisperLanguage,
+		task: task,                    // Hard fixed
+		language: whisperLanguage,     // Hard fixed for Russian
 		streamer,
+		do_sample: false,
+		num_beams: 1,
 	});
 
 	const outputText = tokenizer.batch_decode(outputs, {
 		skip_special_tokens: true,
 	});
 
-	// Send the output back to the main thread
 	console.debug("outputText", outputText);
 	processing = false;
 	return outputText;
 }
 
 export async function initializeWhisperWorker(progress_callback) {
-	// Load the pipeline and save it for future use.
 	const [_tokenizer, _processor, model] =
 		await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
-			// We also add a progress callback to the pipeline so that we can
-			// track model loading.
-			console.debug("data", data);
 			if (
 				data.status === "progress" &&
 				Math.ceil(data.progress * 100) % 10 === 0
 			) {
-				console.debug(`Model loading: ${data.progress}%`);
 				progress_callback(data.progress);
 			}
-			// self.postMessage(data);
 		});
 
-	// Run model with dummy input to compile shaders
 	await model.generate({
 		input_features: full([1, 128, 3000], 0.0),
 		max_new_tokens: 1,
