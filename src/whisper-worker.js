@@ -22,8 +22,9 @@ class AutomaticSpeechRecognitionPipeline {
 	static model = null;
 
 	static async getInstance(progress_callback = null) {
-		// Changed to medium for better Russian support
-		this.model_id = "onnx-community/whisper-medium";
+		// Using whisper-small for reliable loading + good Russian quality
+		// (medium was too heavy for extension WebGPU context and caused 'error')
+		this.model_id = "onnx-community/whisper-small";
 
 		AutomaticSpeechRecognitionPipeline;
 		AutomaticSpeechRecognitionPipeline.tokenizer ??=
@@ -71,56 +72,74 @@ export async function processWhisperMessage(audio, language, task = "transcribe"
 	const whisperLanguage = language ? toWhisperLanguage(language) : null;
 	console.debug("processWhisperMessage → task:", task, "language:", whisperLanguage);
 
-	const [tokenizer, processor, model] =
-		await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
-			if (
-				data.status === "progress" &&
-				Math.ceil(data.progress * 100) % 10 === 0
-			) {
-				console.debug(`Model loading: ${data.progress}%`);
-				chrome.runtime.sendMessage({ type: "whisper-progress", data });
-			}
+	try {
+		const [tokenizer, processor, model] =
+			await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
+				if (
+					data.status === "progress" &&
+					Math.ceil(data.progress * 100) % 10 === 0
+				) {
+					console.debug(`Model loading: ${data.progress}%`);
+					chrome.runtime.sendMessage({ type: "whisper-progress", data });
+				}
+			});
+
+		const streamer = new TextStreamer(tokenizer, {
+			skip_prompt: true,
+			skip_special_tokens: true,
 		});
 
-	const streamer = new TextStreamer(tokenizer, {
-		skip_prompt: true,
-		skip_special_tokens: true,
-	});
+		const inputs = await processor(audio);
 
-	const inputs = await processor(audio);
+		const outputs = await model.generate({
+			...inputs,
+			max_new_tokens: MAX_NEW_TOKENS,
+			task: task,
+			language: whisperLanguage,
+			streamer,
+			do_sample: false,
+			num_beams: 1,
+		});
 
-	const outputs = await model.generate({
-		...inputs,
-		max_new_tokens: MAX_NEW_TOKENS,
-		task: task,                    // Hard fixed
-		language: whisperLanguage,     // Hard fixed for Russian
-		streamer,
-		do_sample: false,
-		num_beams: 1,
-	});
+		const outputText = tokenizer.batch_decode(outputs, {
+			skip_special_tokens: true,
+		});
 
-	const outputText = tokenizer.batch_decode(outputs, {
-		skip_special_tokens: true,
-	});
-
-	console.debug("outputText", outputText);
-	processing = false;
-	return outputText;
+		console.debug("outputText", outputText);
+		processing = false;
+		return outputText;
+	} catch (err) {
+		console.error("Whisper inference error:", err);
+		processing = false;
+		chrome.runtime.sendMessage({
+			type: "model-status",
+			data: { status: "error", message: err.message || String(err) }
+		});
+		return null;
+	}
 }
 
 export async function initializeWhisperWorker(progress_callback) {
-	const [_tokenizer, _processor, model] =
-		await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
-			if (
-				data.status === "progress" &&
-				Math.ceil(data.progress * 100) % 10 === 0
-			) {
-				progress_callback(data.progress);
-			}
-		});
+	try {
+		const [_tokenizer, _processor, model] =
+			await AutomaticSpeechRecognitionPipeline.getInstance((data) => {
+				if (
+					data.status === "progress" &&
+					Math.ceil(data.progress * 100) % 10 === 0
+				) {
+					progress_callback(data.progress);
+				}
+			});
 
-	await model.generate({
-		input_features: full([1, 128, 3000], 0.0),
-		max_new_tokens: 1,
-	});
+		await model.generate({
+				input_features: full([1, 128, 3000], 0.0),
+				max_new_tokens: 1,
+			});
+	} catch (err) {
+		console.error("Model initialization error:", err);
+		chrome.runtime.sendMessage({
+			type: "model-status",
+			data: { status: "error", message: err.message || String(err) }
+		});
+	}
 }
