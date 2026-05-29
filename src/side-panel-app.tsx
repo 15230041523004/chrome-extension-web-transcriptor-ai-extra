@@ -154,7 +154,7 @@ const SidePanelApp: React.FC = () => {
 									onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "translate" }))}
 								/>
 								<span className="text-sm">Translate</span>
-						</label>
+							</label>
 						</div>
 					</div>
 
@@ -247,19 +247,19 @@ const SidePanelApp: React.FC = () => {
 					/>
 				)}
 			</div>
-		</div>
 
-		{captureError && (
-			<div className="mx-2 mb-2 p-3 bg-red-900/30 border border-red-700 rounded text-sm text-red-200">
-				{captureError}
-			</div>
-		)}
-		{modelError && (
-			<div className="mx-2 mb-2 p-3 bg-orange-900/30 border border-orange-700 rounded text-sm text-orange-200">
-				{modelError}
-			</div>
-		)}
-	</div>
+			{/* Error banners */}
+			{captureError && (
+				<div className="mx-2 mb-2 p-3 bg-red-900/30 border border-red-700 rounded text-sm text-red-200">
+					{captureError}
+				</div>
+			)}
+			{modelError && (
+				<div className="mx-2 mb-2 p-3 bg-orange-900/30 border border-orange-700 rounded text-sm text-orange-200">
+					{modelError}
+				</div>
+			)}
+		</div>
 	);
 };
 
