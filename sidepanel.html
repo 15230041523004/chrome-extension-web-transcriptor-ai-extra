@@ -1,13 +1,193 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Web Distiller AI</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/side-panel.tsx"></script>
-  </body>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transcriptor AI</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #0f172a;
+      color: #e2e8f0;
+      width: 380px;
+      min-height: 500px;
+    }
+    .container { max-width: 100%; }
+    h1 { font-size: 18px; margin: 0 0 16px; color: #60a5fa; }
+    .status {
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    .status.ready { background: #166534; color: #4ade80; }
+    .status.recording { background: #7f1d1d; color: #f87171; }
+    .status.error { background: #7f1d1d; color: #fda4af; }
+    .btn {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .btn:hover { background: #2563eb; }
+    .btn:disabled { background: #475569; cursor: not-allowed; }
+    .btn.stop { background: #ef4444; }
+    .btn.stop:hover { background: #dc2626; }
+    .log {
+      background: #1e2937;
+      border-radius: 6px;
+      padding: 12px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      margin-top: 12px;
+    }
+    .error-banner {
+      background: #7f1d1d;
+      color: #fda4af;
+      padding: 10px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      border-left: 4px solid #f87171;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎙️ Transcriptor AI</h1>
+
+    <div id="status" class="status ready">
+      Готов к работе
+    </div>
+
+    <div id="error-banner" class="error-banner" style="display: none;"></div>
+
+    <button id="start-btn" class="btn">▶️ Начать транскрипцию</button>
+    <button id="stop-btn" class="btn stop" style="display: none;">⏹️ Остановить</button>
+
+    <div id="transcript" class="log" style="display: none;"></div>
+
+    <div style="margin-top: 16px; font-size: 11px; color: #64748b;">
+      Модель: Whisper Base (ONNX) • Russian Transcribe
+    </div>
+  </div>
+
+  <script>
+    function safeRender(value) {
+      if (value == null) return '';
+      if (typeof value === 'string') return value;
+      if (typeof value === 'object') {
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch {
+          return String(value);
+        }
+      }
+      return String(value);
+    }
+
+    const statusEl = document.getElementById('status');
+    const errorBanner = document.getElementById('error-banner');
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const transcriptEl = document.getElementById('transcript');
+
+    let isRecording = false;
+
+    function updateStatus(text, type = 'ready') {
+      statusEl.textContent = text;
+      statusEl.className = `status ${type}`;
+    }
+
+    function showError(message) {
+      errorBanner.textContent = safeRender(message);
+      errorBanner.style.display = 'block';
+      setTimeout(() => {
+        errorBanner.style.display = 'none';
+      }, 8000);
+    }
+
+    function appendTranscript(text) {
+      transcriptEl.style.display = 'block';
+      transcriptEl.textContent += (transcriptEl.textContent ? '\n' : '') + text;
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.type === 'capture-error') {
+        showError(message.data?.error || 'Ошибка захвата аудио');
+        updateStatus('Ошибка захвата', 'error');
+        startBtn.style.display = 'block';
+        stopBtn.style.display = 'none';
+      }
+
+      if (message.type === 'recording-state') {
+        isRecording = message.data?.recording ?? false;
+        if (isRecording) {
+          updateStatus('Запись...', 'recording');
+          startBtn.style.display = 'none';
+          stopBtn.style.display = 'block';
+        } else {
+          updateStatus('Готов к работе', 'ready');
+          startBtn.style.display = 'block';
+          stopBtn.style.display = 'none';
+        }
+      }
+
+      if (message.type === 'transcript') {
+        appendTranscript(message.data?.transcripted || '');
+      }
+
+      if (message.type === 'model-status') {
+        const status = message.data?.status;
+        if (status === 'error') {
+          showError(message.data?.message || 'Ошибка модели');
+        }
+      }
+    });
+
+    startBtn.addEventListener('click', async () => {
+      try {
+        updateStatus('Подключение...', 'ready');
+        await chrome.runtime.sendMessage({ type: 'start-transcription' });
+      } catch (err) {
+        showError('Не удалось запустить: ' + safeRender(err));
+      }
+    });
+
+    stopBtn.addEventListener('click', async () => {
+      try {
+        await chrome.runtime.sendMessage({ type: 'stop-transcription' });
+        updateStatus('Остановлено', 'ready');
+      } catch (err) {
+        showError(safeRender(err));
+      }
+    });
+
+    async function init() {
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'get-recording-state' });
+        if (response?.recording) {
+          isRecording = true;
+          updateStatus('Запись...', 'recording');
+          startBtn.style.display = 'none';
+          stopBtn.style.display = 'block';
+        }
+      } catch (e) {}
+    }
+
+    init();
+    console.log('[Sidepanel] Готов');
+  </script>
+</body>
 </html>
