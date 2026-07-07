@@ -11,6 +11,7 @@ import {
 	type TranscriptionSettings,
 	type WhisperModel,
 } from "./jotai/transcriptionSettings";
+import { extractNewAudioSegment, MIN_FLUSH_AUDIO_SAMPLES } from "./lib/incrementalAudio";
 import { normalizeModelProgress } from "./lib/modelProgress";
 import {
 	initializeWhisperWorker,
@@ -20,6 +21,8 @@ import {
 const WHISPER_SAMPLING_RATE = 16_000;
 const MAX_AUDIO_LENGTH = 30;
 const MAX_SAMPLES = WHISPER_SAMPLING_RATE * MAX_AUDIO_LENGTH;
+const MIN_NEW_AUDIO_SECONDS = 1;
+const MIN_NEW_AUDIO_SAMPLES = WHISPER_SAMPLING_RATE * MIN_NEW_AUDIO_SECONDS;
 
 const getRecommendedModel = (): WhisperModel => "base";
 
@@ -30,7 +33,6 @@ const resolveModelId = (whisperModel: WhisperModel): string => {
 
 export const Offscreen: React.FC = () => {
 	const settingsRef = useRef<TranscriptionSettings>(DEFAULT_TRANSCRIPTION_SETTINGS);
-	const [transcriptionSettings, setTranscriptionSettings] = useState(DEFAULT_TRANSCRIPTION_SETTINGS);
 	const recorderRef = React.useRef<MediaRecorder | null>(null);
 	const [recording, setRecording] = useState(false);
 	const audioContextRef = React.useRef<AudioContext | null>(null);
@@ -39,10 +41,17 @@ export const Offscreen: React.FC = () => {
 	const loadedModelIdRef = React.useRef<string | null>(null);
 	const micStreamRef = React.useRef<MediaStream | null>(null);
 	const mixContextRef = React.useRef<AudioContext | null>(null);
+	const chunksRef = React.useRef<Blob[]>([]);
+	const transcribedSamplesRef = React.useRef(0);
+	const transcribeBusyRef = React.useRef(false);
+	const transcribePendingRef = React.useRef(false);
+	const transcribeFlushRef = React.useRef(false);
+	const transcribeLatestAudioRef = React.useRef<(options?: { flush?: boolean }) => Promise<void>>(
+		async () => {},
+	);
 
 	const applySettings = (settings: TranscriptionSettings) => {
 		settingsRef.current = settings;
-		setTranscriptionSettings(settings);
 	};
 
 	const stopActiveRecorder = () => {
@@ -59,6 +68,10 @@ export const Offscreen: React.FC = () => {
 		audioContextRef.current = null;
 		setRecording(false);
 		setChunks([]);
+		chunksRef.current = [];
+		transcribedSamplesRef.current = 0;
+		transcribePendingRef.current = false;
+		transcribeFlushRef.current = false;
 	};
 
 	const setupMediaRecorder = async (streamId: string) => {
@@ -113,12 +126,20 @@ export const Offscreen: React.FC = () => {
 			recorderRef.current.onstart = () => {
 				setRecording(true);
 				setChunks([]);
+				chunksRef.current = [];
+				transcribedSamplesRef.current = 0;
+				transcribePendingRef.current = false;
+				transcribeFlushRef.current = false;
 				chrome.runtime.sendMessage({ type: "recording-state", data: { recording: true } });
 			};
 
 			recorderRef.current.ondataavailable = (e) => {
 				if (e.data.size > 0) {
-					setChunks((prev) => [...prev, e.data]);
+					setChunks((prev) => {
+						const next = [...prev, e.data];
+						chunksRef.current = next;
+						return next;
+					});
 					setTimeout(() => recorderRef.current?.requestData(), 10_000);
 				} else {
 					setTimeout(() => recorderRef.current?.requestData(), 25);
@@ -128,6 +149,7 @@ export const Offscreen: React.FC = () => {
 			recorderRef.current.onstop = () => {
 				setRecording(false);
 				chrome.runtime.sendMessage({ type: "recording-state", data: { recording: false } });
+				void transcribeLatestAudioRef.current({ flush: true });
 			};
 
 			recorderRef.current.start();
@@ -136,73 +158,102 @@ export const Offscreen: React.FC = () => {
 		}
 	};
 
+	const transcribeLatestAudio = React.useCallback(async (options?: { flush?: boolean }) => {
+		if (!recorderRef.current || !audioContextRef.current) return;
+		if (options?.flush) transcribeFlushRef.current = true;
+		if (transcribeBusyRef.current) {
+			transcribePendingRef.current = true;
+			return;
+		}
+
+		transcribeBusyRef.current = true;
+
+		try {
+			do {
+				transcribePendingRef.current = false;
+
+				const currentChunks = chunksRef.current;
+				if (currentChunks.length === 0) break;
+
+				const blob = new Blob(currentChunks, { type: recorderRef.current.mimeType });
+				const arrayBuffer = await blob.arrayBuffer();
+				const decoded = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
+				const fullAudio = decoded.getChannelData(0);
+
+				const minNewSamples = transcribeFlushRef.current
+					? MIN_FLUSH_AUDIO_SAMPLES
+					: MIN_NEW_AUDIO_SAMPLES;
+
+				const segment = extractNewAudioSegment(
+					fullAudio,
+					transcribedSamplesRef.current,
+					MAX_SAMPLES,
+					minNewSamples,
+				);
+				if (!segment) break;
+
+				const settings = settingsRef.current;
+				const modelId = resolveModelId(settings.whisperModel);
+
+				if (!modelLoadedRef.current || loadedModelIdRef.current !== modelId) {
+					modelLoadedRef.current = false;
+					loadedModelIdRef.current = modelId;
+					chrome.runtime.sendMessage({ type: "model-status", data: { status: "loading", progress: 0 } });
+					await initializeWhisperWorker((progress) => {
+						chrome.runtime.sendMessage({
+							type: "model-status",
+							data: { status: "loading", progress: normalizeModelProgress(progress) },
+						});
+					}, modelId);
+					modelLoadedRef.current = true;
+					chrome.runtime.sendMessage({ type: "model-status", data: { status: "ready" } });
+				}
+
+				const { mode, transcribeLanguage } = settings;
+				const task = mode === "translate" ? "translate" : "transcribe";
+				const language = mode === "transcribe" ? transcribeLanguage : null;
+
+				const transcripted = await processWhisperMessage(
+					segment.newAudio,
+					language,
+					task,
+					modelId,
+				);
+
+				transcribedSamplesRef.current = segment.totalSamples;
+
+				const text = transcripted?.join("\n").trim();
+				if (text) {
+					chrome.runtime.sendMessage({
+						type: "transcript",
+						data: { transcripted: text },
+					});
+				}
+			} while (transcribePendingRef.current);
+
+		} catch (err) {
+			console.error("Transcription failed:", err);
+			chrome.runtime.sendMessage({ type: "model-status", data: { status: "error" } });
+		} finally {
+			transcribeBusyRef.current = false;
+			if (!transcribePendingRef.current) {
+				transcribeFlushRef.current = false;
+			}
+		}
+	}, []);
+
+	transcribeLatestAudioRef.current = transcribeLatestAudio;
+
 	useEffect(() => {
 		if (!recorderRef.current) return;
 		if (!recording) return;
 
 		if (chunks.length > 0) {
-			const blob = new Blob(chunks, { type: recorderRef.current.mimeType });
-			const fileReader = new FileReader();
-
-			fileReader.onloadend = async () => {
-				const arrayBuffer = fileReader.result;
-				if (!audioContextRef.current || !arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
-					return;
-				}
-
-				const decoded = await audioContextRef.current.decodeAudioData(arrayBuffer);
-				let audio = decoded.getChannelData(0);
-				if (audio.length > MAX_SAMPLES) {
-					audio = audio.slice(-MAX_SAMPLES);
-				}
-
-				const audioFloat32 = new Float32Array(audio);
-				const settings = settingsRef.current;
-				const modelId = resolveModelId(settings.whisperModel);
-
-				try {
-					if (!modelLoadedRef.current || loadedModelIdRef.current !== modelId) {
-						modelLoadedRef.current = false;
-						loadedModelIdRef.current = modelId;
-						chrome.runtime.sendMessage({ type: "model-status", data: { status: "loading", progress: 0 } });
-						await initializeWhisperWorker((progress) => {
-							chrome.runtime.sendMessage({
-								type: "model-status",
-								data: { status: "loading", progress: normalizeModelProgress(progress) },
-							});
-						}, modelId);
-						modelLoadedRef.current = true;
-						chrome.runtime.sendMessage({ type: "model-status", data: { status: "ready" } });
-					}
-
-					const { mode, transcribeLanguage } = settings;
-					const task = mode === "translate" ? "translate" : "transcribe";
-					const language = mode === "transcribe" ? transcribeLanguage : null;
-
-					const transcripted = await processWhisperMessage(
-						audioFloat32,
-						language,
-						task,
-						modelId,
-					);
-
-					if (transcripted) {
-						chrome.runtime.sendMessage({
-							type: "transcript",
-							data: { transcripted: transcripted.join("\n") },
-						});
-					}
-				} catch (err) {
-					console.error("Transcription failed:", err);
-					chrome.runtime.sendMessage({ type: "model-status", data: { status: "error" } });
-				}
-			};
-
-			fileReader.readAsArrayBuffer(blob);
+			void transcribeLatestAudio();
 		} else {
 			recorderRef.current?.requestData();
 		}
-	}, [recording, chunks, transcriptionSettings]);
+	}, [recording, chunks, transcribeLatestAudio]);
 
 	useEffect(() => {
 		const onMessage = (message: {

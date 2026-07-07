@@ -1,5 +1,6 @@
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, SlidersHorizontal } from "lucide-react";
 import { AiSummarizer } from "./components/ai-summarizer";
 import { Button } from "./components/ui/button";
 import { Textarea } from "./components/ui/textarea";
@@ -41,6 +42,7 @@ const SidePanelApp: React.FC = () => {
 	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 	const [captureError, setCaptureError] = useState<string | null>(null);
 	const [modelError, setModelError] = useState<string | null>(null);
+	const [showMoreSettings, setShowMoreSettings] = useState(false);
 	const transcriptionRef = useRef<HTMLTextAreaElement>(null);
 
 	const isCapturableUrl = (url: string | undefined): boolean => {
@@ -129,7 +131,9 @@ const SidePanelApp: React.FC = () => {
 
 		const messageListener = (message: any) => {
 			if (message.type === "transcript") {
-				setTranscription((prev) => `${prev}\n${message.data?.transcripted ?? ""}`);
+				const next = (message.data?.transcripted ?? "").trim();
+				if (!next) return;
+				setTranscription((prev) => (prev ? `${prev}\n${next}` : next));
 			} else if (message.type === "model-status") {
 				const status = message.data?.status;
 				setModelStatus(
@@ -203,38 +207,81 @@ const SidePanelApp: React.FC = () => {
 	};
 
 	return (
-		<div className="container">
-			<div className="box-border">
-				<div className="flex flex-col m-1 p-1">
-					<div className="flex items-center justify-between gap-2">
-						<h1>Transcription</h1>
-						<label className="flex items-center gap-2 cursor-pointer shrink-0">
-							<input
-								type="checkbox"
-								checked={transcriptionSettings.autoscroll}
-								onChange={(e) =>
-									setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
-								}
-								className="rounded"
-							/>
-							<span className="text-sm">Autoscroll</span>
-						</label>
-					</div>
-					<div className="text-center mt-1">
-						<Textarea ref={transcriptionRef} value={transcription} rows={20} readOnly />
-					</div>
-					<div className="text-center">
-						<h1>Model Status: {modelStatus}</h1>
-						{modelStatus === "loading" && <p>{loadingProgress}% loaded</p>}
-					</div>
-				</div>
+		<div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background">
+			<section className="flex min-h-0 flex-1 flex-col px-2 pt-2 pb-1">
+				<h1 className="shrink-0 text-base font-semibold">Transcription</h1>
+				<Textarea
+					ref={transcriptionRef}
+					value={transcription}
+					readOnly
+					className="mt-1 min-h-0 flex-1 resize-none"
+				/>
+			</section>
 
-				<div className="flex flex-col m-1 p-1">
-					{/* Transcription Mode */}
+			{captureError && (
+				<div className="mx-2 mb-1 shrink-0 rounded border border-red-700 bg-red-900/30 p-2 text-xs text-red-200">
+					{captureError}
+				</div>
+			)}
+			{modelError && (
+				<div className="mx-2 mb-1 shrink-0 rounded border border-orange-700 bg-orange-900/30 p-2 text-xs text-orange-200">
+					{modelError}
+				</div>
+			)}
+
+			<div className="shrink-0 border-t border-border px-2 py-2">
+				<Button
+					type="button"
+					variant="outline"
+					onClick={() => setShowMoreSettings((open) => !open)}
+					aria-expanded={showMoreSettings}
+					className="h-auto w-full justify-between gap-3 px-3 py-2.5 text-left"
+				>
+					<span className="flex min-w-0 items-center gap-2.5">
+						<SlidersHorizontal className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+						<span className="flex min-w-0 flex-col">
+							<span className="text-sm font-semibold text-foreground">
+								{showMoreSettings ? "Less" : "More..."}
+							</span>
+							<span className="truncate text-xs font-normal text-muted-foreground">
+								{showMoreSettings ? "Hide language, model & options" : "Language, model & options"}
+							</span>
+						</span>
+					</span>
+					{showMoreSettings ? (
+						<ChevronUp className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+					) : (
+						<ChevronDown className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+					)}
+				</Button>
+			</div>
+
+			{showMoreSettings && (
+				<div className="max-h-[45vh] shrink-0 overflow-y-auto border-t border-border px-2 py-2">
+					<label className="mb-3 flex cursor-pointer items-center gap-2">
+						<input
+							type="checkbox"
+							checked={transcriptionSettings.autoscroll}
+							onChange={(e) =>
+								setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
+							}
+							className="rounded"
+						/>
+						<span className="text-sm">Autoscroll</span>
+					</label>
+
+					<div className="mb-2 text-sm">
+						<span className="font-medium">Model Status: </span>
+						<span className="text-muted-foreground">{modelStatus}</span>
+						{modelStatus === "loading" && (
+							<span className="text-muted-foreground"> ({loadingProgress}% loaded)</span>
+						)}
+					</div>
+
 					<div className="mb-2">
-						<span className="text-sm font-medium block mb-1">Transcription Mode</span>
+						<span className="mb-1 block text-sm font-medium">Transcription Mode</span>
 						<div className="flex gap-4">
-							<label className="flex items-center gap-2 cursor-pointer">
+							<label className="flex cursor-pointer items-center gap-2">
 								<input
 									type="radio"
 									name="mode"
@@ -243,7 +290,7 @@ const SidePanelApp: React.FC = () => {
 								/>
 								<span className="text-sm">Transcribe</span>
 							</label>
-							<label className="flex items-center gap-2 cursor-pointer">
+							<label className="flex cursor-pointer items-center gap-2">
 								<input
 									type="radio"
 									name="mode"
@@ -257,24 +304,24 @@ const SidePanelApp: React.FC = () => {
 
 					{transcriptionSettings.mode === "transcribe" && (
 						<div className="mb-2">
-							<span className="text-sm font-medium block mb-1">Source Language</span>
+							<span className="mb-1 block text-sm font-medium">Source Language</span>
 							<LanguageSelector
 								language={transcriptionSettings.transcribeLanguage}
 								setLanguage={(lang) => setTranscriptionSettings((prev) => ({ ...prev, transcribeLanguage: lang }))}
 								includeAuto
 							/>
-							<p className="text-xs text-muted-foreground mt-1">Output in the same language as input</p>
+							<p className="mt-1 text-xs text-muted-foreground">Output in the same language as input</p>
 						</div>
 					)}
 
 					{transcriptionSettings.mode === "translate" && (
 						<div className="mb-2">
-							<label htmlFor="translate-target-language" className="text-sm font-medium block mb-1">
+							<label htmlFor="translate-target-language" className="mb-1 block text-sm font-medium">
 								Target Language
 							</label>
 							<select
 								id="translate-target-language"
-								className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500 hover:bg-zinc-800 transition-colors"
+								className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
 								value={transcriptionSettings.translateTargetLanguage ?? "english"}
 								onChange={(e) =>
 									setTranscriptionSettings((prev) => ({
@@ -289,103 +336,99 @@ const SidePanelApp: React.FC = () => {
 									</option>
 								))}
 							</select>
-							<p className="text-xs text-muted-foreground mt-1">
+							<p className="mt-1 text-xs text-muted-foreground">
 								Translate audio to English (Whisper limitation)
 							</p>
 						</div>
 					)}
 
 					<div className="mb-3">
-						<span className="text-sm font-medium block mb-1">AI Model</span>
+						<span className="mb-1 block text-sm font-medium">AI Model</span>
 						<select
 							value={transcriptionSettings.whisperModel}
 							onChange={(e) => handleModelChange(e.target.value as WhisperModel)}
-							className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500 hover:bg-zinc-800 transition-colors"
+							className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
 						>
 							{Object.entries(WHISPER_MODELS).map(([key, label]) => (
-								<option key={key} value={key}>{label}</option>
+								<option key={key} value={key}>
+									{label}
+								</option>
 							))}
 						</select>
-						<p className="text-xs text-muted-foreground mt-1">
+						<p className="mt-1 text-xs text-muted-foreground">
 							Auto picks the best model for your device. Base is recommended for stability.
 						</p>
 					</div>
 
-					<label className="flex items-center gap-2 mt-2 cursor-pointer">
+					<label className="mb-1 flex cursor-pointer items-center gap-2">
 						<input
 							type="checkbox"
 							checked={transcriptionSettings.includeMicrophone ?? false}
-							onChange={(e) => setTranscriptionSettings((prev) => ({ ...prev, includeMicrophone: e.target.checked }))}
+							onChange={(e) =>
+								setTranscriptionSettings((prev) => ({ ...prev, includeMicrophone: e.target.checked }))
+							}
 							className="rounded"
 						/>
 						<span className="text-sm">Include microphone</span>
 					</label>
-					<p className="text-xs text-muted-foreground mt-0.5">Mix your voice with tab audio for transcription</p>
-				</div>
-
-				<div className="flex flex-col gap-2 m-1 p-1">
-					<p className="text-xs text-muted-foreground">
-						Надёжный способ: закройте side panel, откройте YouTube и кликните иконку расширения на вкладке с видео.
+					<p className="mb-3 text-xs text-muted-foreground">
+						Mix your voice with tab audio for transcription
 					</p>
-					<div className="flex gap-2">
-						<Button
-							variant={isRecording ? "outline" : "default"}
-							disabled={isRecording}
-							onClick={handleStartTranscription}
-						>
-							{isRecording ? "Recording..." : "Start"}
-						</Button>
-						<Button
-							variant={isRecording ? "destructive" : "outline"}
-							onClick={() => chrome.runtime.sendMessage({ type: "stop-transcription" })}
-						>
-							Stop
-						</Button>
-					</div>
-				</div>
 
-				<div className="flex flex-col m-1 p-1">
+					<p className="mb-3 text-xs text-muted-foreground">
+						For reliable capture: close the side panel, open YouTube, and click the extension icon on the
+						tab with video.
+					</p>
+
+					{aiCapabilities.available === "no" && (
+						<div className="mb-3 text-center text-sm">
+							<p className="font-medium">AI Summarization is not available</p>
+							<p className="text-xs text-muted-foreground">Please make sure your Chrome supports Prompt API.</p>
+						</div>
+					)}
+					{aiCapabilities.available !== "no" && (
+						<AiSummarizer
+							setLanguage={(language: TranscriptionLanguage) =>
+								setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
+							}
+							language={transcriptionSettings.summarizationLanguage}
+							isSummaryLoading={isSummaryLoading}
+							handleSummarize={handleSummarize}
+							summary={summary}
+						/>
+					)}
+				</div>
+			)}
+
+			<footer className="shrink-0 space-y-2 border-t border-border p-2">
+				<div className="flex gap-2">
 					<Button
-						onClick={() => {
-							navigator.clipboard.writeText(transcription);
-							toast({ description: "Copied to clipboard", color: "success", duration: 1000 });
-						}}
+						className="flex-1"
+						variant={isRecording ? "outline" : "default"}
+						disabled={isRecording}
+						onClick={handleStartTranscription}
 					>
-						Copy to Clipboard
+						{isRecording ? "Recording..." : "Start"}
+					</Button>
+					<Button
+						className="flex-1"
+						variant={isRecording ? "destructive" : "outline"}
+						onClick={() => chrome.runtime.sendMessage({ type: "stop-transcription" })}
+					>
+						Stop
 					</Button>
 				</div>
-
-				{aiCapabilities.available === "no" && (
-					<div className="flex flex-col m-1 p-1">
-						<div className="text-center">
-							<h1>AI Summarization is not available</h1>
-							<p>Please make sure your Chrome supports Prompt API.</p>
-						</div>
-					</div>
-				)}
-				{aiCapabilities.available !== "no" && (
-					<AiSummarizer
-						setLanguage={(language: TranscriptionLanguage) =>
-							setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))}
-						language={transcriptionSettings.summarizationLanguage}
-						isSummaryLoading={isSummaryLoading}
-						handleSummarize={handleSummarize}
-						summary={summary}
-					/>
-				)}
-			</div>
-
-			{/* Error banners */}
-			{captureError && (
-				<div className="mx-2 mb-2 p-3 bg-red-900/30 border border-red-700 rounded text-sm text-red-200">
-					{captureError}
-				</div>
-			)}
-			{modelError && (
-				<div className="mx-2 mb-2 p-3 bg-orange-900/30 border border-orange-700 rounded text-sm text-orange-200">
-					{modelError}
-				</div>
-			)}
+				<Button
+					className="w-full"
+					variant="outline"
+					onClick={() => {
+						navigator.clipboard.writeText(transcription);
+						toast({ description: "Copied to clipboard", color: "success", duration: 1000 });
+					}}
+				>
+					Copy to Clipboard
+				</Button>
+			</footer>
 		</div>
 	);
 };
