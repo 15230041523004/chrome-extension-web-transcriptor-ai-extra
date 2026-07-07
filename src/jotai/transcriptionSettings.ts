@@ -131,6 +131,7 @@ export type TranscriptionSettings = {
 	transcribeLanguage: TranscriptionLanguage | null;
 	translateTargetLanguage: TranslateTargetLanguage | null;
 	includeMicrophone: boolean;
+	autoscroll: boolean;
 	summarizationLanguage: TranscriptionLanguage;
 	whisperModel: WhisperModel;
 };
@@ -142,6 +143,7 @@ export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
 	transcribeLanguage: null,
 	translateTargetLanguage: "english",
 	includeMicrophone: false,
+	autoscroll: true,
 	summarizationLanguage: "english" as TranscriptionLanguage,
 	whisperModel: "auto",
 };
@@ -153,12 +155,12 @@ export function migrateTranscriptionSettings(stored: unknown): TranscriptionSett
 		const lang = s.language as string;
 		const base = lang?.includes("/") ? lang.split("/")[0].trim() : lang;
 		return {
+			...DEFAULT_TRANSCRIPTION_SETTINGS,
 			mode: base === "english" ? "transcribe" : "translate",
 			transcribeLanguage: base === "english" ? (lang as TranscriptionLanguage) : null,
 			translateTargetLanguage: "english",
 			includeMicrophone: Boolean(s.includeMicrophone),
 			summarizationLanguage: (s.language as TranscriptionLanguage) ?? "english",
-			whisperModel: "auto",
 		};
 	}
 	return { ...DEFAULT_TRANSCRIPTION_SETTINGS, ...s } as TranscriptionSettings;

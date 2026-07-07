@@ -1,5 +1,5 @@
 import type React from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AiSummarizer } from "./components/ai-summarizer";
 import { Button } from "./components/ui/button";
 import { Textarea } from "./components/ui/textarea";
@@ -41,6 +41,7 @@ const SidePanelApp: React.FC = () => {
 	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 	const [captureError, setCaptureError] = useState<string | null>(null);
 	const [modelError, setModelError] = useState<string | null>(null);
+	const transcriptionRef = useRef<HTMLTextAreaElement>(null);
 
 	const isCapturableUrl = (url: string | undefined): boolean => {
 		if (!url) return false;
@@ -158,6 +159,14 @@ const SidePanelApp: React.FC = () => {
 		};
 	}, [setModelStatus, setLoadingProgress]);
 
+	useEffect(() => {
+		if (!transcriptionSettings.autoscroll) return;
+		const textarea = transcriptionRef.current;
+		if (textarea) {
+			textarea.scrollTop = textarea.scrollHeight;
+		}
+	}, [transcription, transcriptionSettings.autoscroll]);
+
 	const { toast } = useToast();
 
 	const handleSummarize = async () => {
@@ -197,9 +206,22 @@ const SidePanelApp: React.FC = () => {
 		<div className="container">
 			<div className="box-border">
 				<div className="flex flex-col m-1 p-1">
-					<h1>Transcription</h1>
+					<div className="flex items-center justify-between gap-2">
+						<h1>Transcription</h1>
+						<label className="flex items-center gap-2 cursor-pointer shrink-0">
+							<input
+								type="checkbox"
+								checked={transcriptionSettings.autoscroll}
+								onChange={(e) =>
+									setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
+								}
+								className="rounded"
+							/>
+							<span className="text-sm">Autoscroll</span>
+						</label>
+					</div>
 					<div className="text-center mt-1">
-						<Textarea value={transcription} rows={20} readOnly />
+						<Textarea ref={transcriptionRef} value={transcription} rows={20} readOnly />
 					</div>
 					<div className="text-center">
 						<h1>Model Status: {modelStatus}</h1>
