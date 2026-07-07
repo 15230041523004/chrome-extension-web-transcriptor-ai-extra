@@ -1,0 +1,93 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build extension",
+      "type": "npm",
+      "script": "build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "showReuseMessage": false
+      },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "watch extension",
+      "type": "npm",
+      "script": "build:watch",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "building",
+          "endsPattern": "built in|Found \\d+ errors"
+        }
+      }
+    },
+    {
+      "label": "start chrome with extension",
+      "dependsOn": ["build extension"],
+      "dependsOrder": "sequence",
+      "type": "shell",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/launch-chrome-extension.mjs"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start chrome with extension (no build)",
+      "type": "shell",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/launch-chrome-extension.mjs"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start chrome with extension (youtube)",
+      "dependsOn": ["build extension"],
+      "dependsOrder": "sequence",
+      "type": "shell",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/scripts/launch-chrome-extension.mjs",
+        "https://www.youtube.com"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      },
+      "problemMatcher": []
+    }
+  ]
+}

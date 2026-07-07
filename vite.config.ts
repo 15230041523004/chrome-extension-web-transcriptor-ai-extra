@@ -24,6 +24,8 @@ function copyOrtMjs() {
 
 // https://vitejs.dev/config/
 export default defineConfig({
+	// Relative paths are required for Chrome extension pages (MV3).
+	base: "./",
 	plugins: [react(), copyOrtMjs()],
 	resolve: {
 		alias: {

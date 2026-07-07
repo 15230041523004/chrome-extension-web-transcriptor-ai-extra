@@ -142,15 +142,11 @@ export const Offscreen: React.FC = () => {
 		fileReader.readAsArrayBuffer(blob);
 	}, [recording, chunks, transcriptionSettings]);
 
-	const setupTriggeredRef = React.useRef(false);
-	const setupOffscreen = () => {
-		if (setupTriggeredRef.current) return;
-		setupTriggeredRef.current = true;
-
-		chrome.runtime.onMessage.addListener(async (message) => {
+	useEffect(() => {
+		const onMessage = async (message: { target?: string; type?: string; streamId?: string }) => {
 			if (message.target !== "offscreen") return;
 
-			if (message.type === "start-recording") {
+			if (message.type === "start-recording" && message.streamId) {
 				setupMediaRecorder(message.streamId);
 			} else if (message.type === "stop-recording") {
 				if (recorderRef.current?.state === "recording") {
@@ -163,14 +159,15 @@ export const Offscreen: React.FC = () => {
 				mixContextRef.current?.close();
 				mixContextRef.current = null;
 			}
-		});
+		};
 
+		chrome.runtime.onMessage.addListener(onMessage);
 		chrome.runtime.sendMessage({ type: "offscreen-ready" });
-	};
 
-	useEffect(() => {
-		setupOffscreen();
-	});
+		return () => {
+			chrome.runtime.onMessage.removeListener(onMessage);
+		};
+	}, []);
 
 	return <div><h1>Offscreen Document</h1></div>;
 };
