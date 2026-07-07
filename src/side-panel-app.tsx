@@ -18,6 +18,7 @@ import {
 	modelLoadingProgressAtom,
 	modelStatusAtom,
 } from "./jotai/modelStatusAtom";
+import { normalizeModelProgress } from "./lib/modelProgress";
 
 const fetchAiCapabilities = async () => {
 	if (!window.ai) {
@@ -36,13 +37,85 @@ const SidePanelApp: React.FC = () => {
 	const [modelStatus, setModelStatus] = useAtom(modelStatusAtom);
 	const [loadingProgress, setLoadingProgress] = useAtom(modelLoadingProgressAtom);
 	const [isRecording, setIsRecording] = useState(false);
+	const [activeTabId, setActiveTabId] = useState<number | null>(null);
+	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 	const [captureError, setCaptureError] = useState<string | null>(null);
 	const [modelError, setModelError] = useState<string | null>(null);
+
+	const isCapturableUrl = (url: string | undefined): boolean => {
+		if (!url) return false;
+		const blockedPrefixes = [
+			"chrome://",
+			"chrome-extension://",
+			"about:",
+			"edge://",
+			"brave://",
+			"devtools://",
+		];
+		return !blockedPrefixes.some((prefix) => url.startsWith(prefix));
+	};
+
+	const refreshActiveTab = () => {
+		chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+			const tab = tabs[0];
+			if (typeof tab?.id === "number") {
+				setActiveTabId(tab.id);
+				setActiveTabUrl(tab.url);
+			}
+		});
+	};
+
+	const handleStartTranscription = () => {
+		if (isRecording) {
+			chrome.runtime.sendMessage({ type: "stop-transcription" });
+			return;
+		}
+
+		if (activeTabId === null) {
+			setCaptureError("Не удалось определить активную вкладку. Переключитесь на вкладку с аудио и попробуйте снова.");
+			return;
+		}
+
+		if (!isCapturableUrl(activeTabUrl)) {
+			setCaptureError(
+				`Нельзя захватить эту страницу (${activeTabUrl ?? "unknown"}). Откройте YouTube и кликните иконку расширения на вкладке с видео.`,
+			);
+			return;
+		}
+
+		chrome.runtime.sendMessage({ type: "prepare-capture", target: "offscreen" });
+		chrome.tabCapture.getMediaStreamId({ targetTabId: activeTabId }, (streamId) => {
+			const captureError = chrome.runtime.lastError;
+			if (captureError || !streamId) {
+				const detail = captureError?.message ?? "unknown error";
+				if (detail.includes("not been invoked") || detail.includes("activeTab")) {
+					setCaptureError(
+						"Chrome разрешает захват только при клике по иконке расширения на вкладке с видео. Закройте side panel, откройте YouTube и кликните иконку.",
+					);
+				} else {
+					setCaptureError(`Захват отклонён: ${detail}`);
+				}
+				return;
+			}
+
+			chrome.runtime.sendMessage({ type: "start-with-stream-id", streamId });
+		});
+	};
 
 	useEffect(() => {
 		fetchAiCapabilities().then((capabilities) => {
 			setAiCapabilities(capabilities);
 		});
+
+		refreshActiveTab();
+		const onTabActivated = () => refreshActiveTab();
+		const onTabUpdated = (_tabId: number, changeInfo: { url?: string; status?: string }) => {
+			if (changeInfo.url || changeInfo.status === "complete") {
+				refreshActiveTab();
+			}
+		};
+		chrome.tabs.onActivated.addListener(onTabActivated);
+		chrome.tabs.onUpdated.addListener(onTabUpdated);
 
 		chrome.runtime.sendMessage(
 			{ type: "get-recording-state" },
@@ -68,7 +141,7 @@ const SidePanelApp: React.FC = () => {
 					setTimeout(() => setModelError(null), 8000);
 				}
 				if (message.data?.status === "loading") {
-					setLoadingProgress(message.data?.progress ?? 0);
+					setLoadingProgress(normalizeModelProgress(message.data?.progress));
 				}
 			} else if (message.type === "recording-state") {
 				setIsRecording(message.data?.recording ?? false);
@@ -80,6 +153,8 @@ const SidePanelApp: React.FC = () => {
 		chrome.runtime.onMessage.addListener(messageListener);
 		return () => {
 			chrome.runtime.onMessage.removeListener(messageListener);
+			chrome.tabs.onActivated.removeListener(onTabActivated);
+			chrome.tabs.onUpdated.removeListener(onTabUpdated);
 		};
 	}, [setModelStatus, setLoadingProgress]);
 
@@ -170,6 +245,34 @@ const SidePanelApp: React.FC = () => {
 						</div>
 					)}
 
+					{transcriptionSettings.mode === "translate" && (
+						<div className="mb-2">
+							<label htmlFor="translate-target-language" className="text-sm font-medium block mb-1">
+								Target Language
+							</label>
+							<select
+								id="translate-target-language"
+								className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-violet-500 hover:bg-zinc-800 transition-colors"
+								value={transcriptionSettings.translateTargetLanguage ?? "english"}
+								onChange={(e) =>
+									setTranscriptionSettings((prev) => ({
+										...prev,
+										translateTargetLanguage: e.target.value as "english",
+									}))
+								}
+							>
+								{_TRANSLATE_TARGET_LANGUAGES.map((lang) => (
+									<option key={lang} value={lang}>
+										{lang.charAt(0).toUpperCase() + lang.slice(1)}
+									</option>
+								))}
+							</select>
+							<p className="text-xs text-muted-foreground mt-1">
+								Translate audio to English (Whisper limitation)
+							</p>
+						</div>
+					)}
+
 					<div className="mb-3">
 						<span className="text-sm font-medium block mb-1">AI Model</span>
 						<select
@@ -199,17 +302,19 @@ const SidePanelApp: React.FC = () => {
 				</div>
 
 				<div className="flex flex-col gap-2 m-1 p-1">
+					<p className="text-xs text-muted-foreground">
+						Надёжный способ: закройте side panel, откройте YouTube и кликните иконку расширения на вкладке с видео.
+					</p>
 					<div className="flex gap-2">
 						<Button
 							variant={isRecording ? "outline" : "default"}
 							disabled={isRecording}
-							onClick={() => chrome.runtime.sendMessage({ type: "start-transcription" })}
+							onClick={handleStartTranscription}
 						>
-							Resume
+							{isRecording ? "Recording..." : "Start"}
 						</Button>
 						<Button
 							variant={isRecording ? "destructive" : "outline"}
-							disabled={!isRecording}
 							onClick={() => chrome.runtime.sendMessage({ type: "stop-transcription" })}
 						>
 							Stop

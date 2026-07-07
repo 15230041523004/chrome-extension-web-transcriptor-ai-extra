@@ -4,9 +4,11 @@ export declare module "./whisper-worker.js" {
 		audio: Float32Array,
 		language: string | null,
 		task: "transcribe" | "translate",
+		modelId?: string | null,
 		// biome-ignore lint/suspicious/noExplicitAny: Whisper returns transcription result object
 	): Promise<any>;
 	export declare function initializeWhisperWorker(
-		progressCallbackFunc: (progress: number) => void,
+		progressCallbackFunc: (progress: unknown) => void,
+		modelId?: string | null,
 	): Promise<void>;
 }

@@ -1,99 +1,190 @@
-let pendingTabId: number | undefined;
+import { loadTranscriptionSettings } from "./jotai/transcriptionSettings";
+
+const BUILD_TAG = "background-v6-sidepanel-capture";
+
 let isRecording = false;
+let offscreenReadyPromise: Promise<void> | null = null;
 
 const isCapturableUrl = (url: string | undefined): boolean => {
 	if (!url) return false;
-	const blockedPrefixes = ["chrome://", "chrome-extension://", "about:", "edge://", "brave://"];
-	return !blockedPrefixes.some(prefix => url.startsWith(prefix));
+	const blockedPrefixes = [
+		"chrome://",
+		"chrome-extension://",
+		"about:",
+		"edge://",
+		"brave://",
+		"devtools://",
+		"view-source:",
+	];
+	return !blockedPrefixes.some((prefix) => url.startsWith(prefix));
+};
+
+const formatChromeError = (error: chrome.runtime.LastError | undefined): string => {
+	if (!error) return "unknown error";
+	return error.message || String(error);
 };
 
 const sendCaptureError = (error: string) => {
+	isRecording = false;
 	chrome.runtime.sendMessage({
 		type: "capture-error",
-		data: { error }
+		data: { error },
+	});
+	chrome.runtime.sendMessage({
+		type: "recording-state",
+		data: { recording: false },
 	});
 };
 
-const sendStartRecording = (tabId: number) => {
-	chrome.tabs.get(tabId, (tab) => {
-		if (!tab || !isCapturableUrl(tab.url)) {
-			console.error("Cannot capture this page (Chrome internal or restricted page)");
-			sendCaptureError("Невозможно захватить эту вкладку. Chrome не разрешает захватывать внутренние страницы (chrome://, about: и т.д.). Откройте обычный сайт (например, YouTube, статью или видео) и попробуйте снова.");
-			return;
-		}
-
-		chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-			if (chrome.runtime.lastError || !streamId) {
-				console.error("service-worker: Failed to get stream ID", chrome.runtime.lastError);
-				sendCaptureError("Не удалось получить доступ к аудио вкладки. Убедитесь, что у расширения есть разрешение и вы находитесь на обычном сайте.");
-				return;
-			}
-			console.debug("Stream ID:", streamId);
-			chrome.runtime.sendMessage({
-				type: "start-recording",
-				target: "offscreen",
-				streamId,
-			});
-		});
+const stopRecording = (): void => {
+	isRecording = false;
+	chrome.runtime.sendMessage({ type: "stop-recording", target: "offscreen" });
+	chrome.runtime.sendMessage({
+		type: "recording-state",
+		data: { recording: false },
 	});
 };
 
-const startRecording = async (tabId: number): Promise<void> => {
-	const existingContexts = await chrome.runtime.getContexts({});
-	const offscreenDocument = existingContexts.find(
-		(c) => c.contextType === "OFFSCREEN_DOCUMENT",
-	);
+const ensureOffscreenDocument = async (): Promise<void> => {
+	if (!offscreenReadyPromise) {
+		offscreenReadyPromise = (async () => {
+			const existingContexts = await chrome.runtime.getContexts({});
+			const offscreenDocument = existingContexts.find(
+				(c) => c.contextType === "OFFSCREEN_DOCUMENT",
+			);
+			if (offscreenDocument) return;
 
-	if (!offscreenDocument) {
-		try {
 			await chrome.offscreen.createDocument({
 				url: "offscreen.html",
 				reasons: [chrome.offscreen.Reason.USER_MEDIA],
 				justification: "Recording from chrome.tabCapture API",
 			});
-			pendingTabId = tabId;
-		} catch (err) {
-			console.error("Failed to create offscreen document:", err);
-			pendingTabId = undefined;
-			sendCaptureError("Не удалось создать offscreen документ. Попробуйте перезагрузить расширение.");
+		})().catch((err) => {
+			offscreenReadyPromise = null;
 			throw err;
-		}
-	} else {
-		sendStartRecording(tabId);
+		});
 	}
+
+	await offscreenReadyPromise;
 };
 
-chrome.action.onClicked.addListener(async (tab) => {
-	if (tab.id === undefined) {
-		console.debug("Tab ID is undefined");
+const deliverStreamToOffscreen = (streamId: string): void => {
+	void (async () => {
+		try {
+			await ensureOffscreenDocument();
+			const settings = await loadTranscriptionSettings();
+			chrome.runtime.sendMessage({
+				type: "start-recording",
+				target: "offscreen",
+				streamId,
+				settings,
+			});
+		} catch (err) {
+			console.error(`[${BUILD_TAG}] Failed to deliver stream to offscreen:`, err);
+			sendCaptureError("Не удалось создать offscreen документ. Перезагрузите расширение.");
+		}
+	})();
+};
+
+const handleCaptureFailure = (detail: string, tabId?: number): void => {
+	console.error(
+		`[${BUILD_TAG}] getMediaStreamId failed${tabId !== undefined ? ` for tab ${tabId}` : ""}:`,
+		detail,
+	);
+
+	if (detail.includes("active stream")) {
+		stopRecording();
+		chrome.runtime.sendMessage({ type: "prepare-capture", target: "offscreen" });
+		sendCaptureError(
+			"Вкладка уже захвачена. Нажмите Stop, подождите секунду и снова кликните по иконке расширения.",
+		);
 		return;
 	}
-	await startRecording(tab.id);
+
+	if (detail.includes("not been invoked") || detail.includes("activeTab")) {
+		sendCaptureError(
+			"Кликните по иконке расширения на вкладке с видео (YouTube и т.д.). Захват из side panel не разрешён Chrome для этой вкладки.",
+		);
+		return;
+	}
+
+	sendCaptureError(`Захват аудио отклонён Chrome: ${detail}`);
+};
+
+/**
+ * Icon click: getMediaStreamId must run immediately in the onClicked handler.
+ */
+const beginRecordingFromIcon = (tab: chrome.tabs.Tab): void => {
+	if (tab.id === undefined) return;
+
+	if (!isCapturableUrl(tab.url)) {
+		sendCaptureError(
+			`Нельзя захватить эту страницу (${tab.url ?? "unknown"}). Откройте YouTube и кликните иконку расширения на этой вкладке.`,
+		);
+		return;
+	}
+
+	chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (streamId) => {
+		const captureError = chrome.runtime.lastError;
+		if (captureError || !streamId) {
+			handleCaptureFailure(formatChromeError(captureError), tab.id);
+			return;
+		}
+
+		console.debug(`[${BUILD_TAG}] Stream ID acquired from icon click for tab ${tab.id}`);
+		chrome.runtime.sendMessage({ type: "prepare-capture", target: "offscreen" });
+		deliverStreamToOffscreen(streamId);
+	});
+};
+
+const beginRecordingWithStreamId = (streamId: string): void => {
+	chrome.runtime.sendMessage({ type: "prepare-capture", target: "offscreen" });
+	deliverStreamToOffscreen(streamId);
+};
+
+chrome.runtime.onInstalled.addListener(() => {
+	void ensureOffscreenDocument().catch((err) => {
+		console.warn(`[${BUILD_TAG}] Offscreen pre-warm failed:`, err);
+	});
+});
+
+chrome.runtime.onStartup.addListener(() => {
+	void ensureOffscreenDocument().catch((err) => {
+		console.warn(`[${BUILD_TAG}] Offscreen pre-warm failed:`, err);
+	});
+});
+
+chrome.action.onClicked.addListener((tab) => {
+	if (isRecording) {
+		stopRecording();
+		return;
+	}
+
+	beginRecordingFromIcon(tab);
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-	if (message.type === "start-transcription") {
-		chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-			try {
-				const tab = tabs[0];
-				if (tab?.id) {
-					await startRecording(tab.id);
-					sendResponse({ success: true });
-				} else {
-					sendCaptureError("Нет активной вкладки");
-					sendResponse({ success: false, error: "No active tab" });
-				}
-			} catch (err) {
-				console.error("Failed to start transcription:", err);
-				sendCaptureError(String(err));
-				sendResponse({ success: false, error: String(err) });
-			}
-		});
-		return true;
+	if (message.type === "start-with-stream-id") {
+		const streamId = message.streamId as string | undefined;
+		if (!streamId) {
+			sendCaptureError("Не получен streamId. Попробуйте снова.");
+			sendResponse({ success: false });
+			return false;
+		}
+
+		if (isRecording) {
+			stopRecording();
+			sendResponse({ success: true, stopped: true });
+			return false;
+		}
+
+		beginRecordingWithStreamId(streamId);
+		sendResponse({ success: true });
+		return false;
 	}
 
 	if (message.type === "stop-transcription") {
-		chrome.runtime.sendMessage({ type: "stop-recording", target: "offscreen" });
+		stopRecording();
 		sendResponse({ success: true });
 		return false;
 	}
@@ -105,17 +196,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 	if (message.type === "recording-state") {
 		isRecording = message.data?.recording ?? false;
-		chrome.runtime.sendMessage({ type: "recording-state", data: { recording: isRecording } });
-		return false;
-	}
-
-	if (message.type === "offscreen-ready") {
-		if (pendingTabId === undefined) return false;
-		const tabId = pendingTabId;
-		pendingTabId = undefined;
-		sendStartRecording(tabId);
+		chrome.runtime.sendMessage({
+			type: "recording-state",
+			data: { recording: isRecording },
+		});
 		return false;
 	}
 
 	return false;
+});
+
+console.log(`[${BUILD_TAG}] Service worker loaded`);
+void ensureOffscreenDocument().catch(() => {
+	// Offscreen is created lazily on first capture if pre-warm fails.
 });
