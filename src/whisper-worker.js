@@ -3,6 +3,7 @@
 import {
 	AutoProcessor,
 	AutoTokenizer,
+	Tensor,
 	TextStreamer,
 	WhisperForConditionalGeneration,
 } from "@huggingface/transformers";
@@ -159,6 +160,120 @@ function resolveWhisperLanguage(language) {
 	return LANGUAGE_NAME_TO_CODE[normalized] ?? null;
 }
 
+const SLAVIC_LANGUAGE_CODES = new Set(["ru", "uk", "be", "bg", "sr", "mk", "kk"]);
+const LANGUAGE_PRIORITY_MARGIN = 1.0;
+const MIN_LANGUAGE_DETECTION_SAMPLES = WHISPER_SAMPLE_RATE / 2;
+const MAX_LANGUAGE_DETECTION_SAMPLES = WHISPER_SAMPLE_RATE * 30;
+
+function applyLanguageDetectionPriority(detectedLanguage, languageScores, priorityLanguage) {
+	const priorityCode = resolveWhisperLanguage(priorityLanguage);
+	if (!priorityCode || priorityCode !== "ru") {
+		return detectedLanguage;
+	}
+
+	const bestScore = languageScores.get(detectedLanguage) ?? Number.NEGATIVE_INFINITY;
+	const russianScore = languageScores.get("ru") ?? Number.NEGATIVE_INFINITY;
+	if (russianScore === Number.NEGATIVE_INFINITY) {
+		return detectedLanguage;
+	}
+
+	if (
+		detectedLanguage !== "ru" &&
+		(russianScore >= bestScore - LANGUAGE_PRIORITY_MARGIN ||
+			(SLAVIC_LANGUAGE_CODES.has(detectedLanguage) &&
+				russianScore >= bestScore - LANGUAGE_PRIORITY_MARGIN * 1.5))
+	) {
+		return "ru";
+	}
+
+	return detectedLanguage;
+}
+
+async function detectWhisperLanguage(model, processor, audio) {
+	const samplingRate = processor.feature_extractor.config.sampling_rate ?? WHISPER_SAMPLE_RATE;
+	const detectionAudio =
+		audio.length > MAX_LANGUAGE_DETECTION_SAMPLES
+			? audio.subarray(0, MAX_LANGUAGE_DETECTION_SAMPLES)
+			: audio;
+
+	if (detectionAudio.length < MIN_LANGUAGE_DETECTION_SAMPLES) {
+		return null;
+	}
+
+	const generationConfig = model._prepare_generation_config(null, { task: "transcribe" });
+	if (!generationConfig?.is_multilingual || !generationConfig.lang_to_id) {
+		return null;
+	}
+
+	const inputs = await processor(detectionAudio);
+	const decoderStartTokenId = generationConfig.decoder_start_token_id;
+	if (decoderStartTokenId == null) {
+		return null;
+	}
+
+	const decoderInputIds = new Tensor(
+		"int64",
+		BigInt64Array.from([BigInt(decoderStartTokenId)]),
+		[1, 1],
+	);
+
+	const outputs = await model.forward({
+		input_features: inputs.input_features,
+		decoder_input_ids: decoderInputIds,
+	});
+
+	const logits = outputs?.logits?.tolist?.();
+	if (!logits?.[0]?.length) {
+		return null;
+	}
+
+	const nextTokenLogits = logits[0][logits[0].length - 1];
+	const languageScores = new Map();
+
+	for (const [token, tokenId] of Object.entries(generationConfig.lang_to_id)) {
+		const match = token.match(/^<\|([a-z]{2})\|>$/);
+		if (!match || typeof tokenId !== "number") continue;
+		languageScores.set(match[1], nextTokenLogits[tokenId] ?? Number.NEGATIVE_INFINITY);
+	}
+
+	if (languageScores.size === 0) {
+		return null;
+	}
+
+	let detectedLanguage = "en";
+	let bestScore = Number.NEGATIVE_INFINITY;
+	for (const [code, score] of languageScores.entries()) {
+		if (score > bestScore) {
+			bestScore = score;
+			detectedLanguage = code;
+		}
+	}
+
+	return { detectedLanguage, languageScores };
+}
+
+async function resolveEffectiveWhisperLanguage(model, processor, audio, language, languagePriority) {
+	const explicitLanguage = resolveWhisperLanguage(language);
+	if (explicitLanguage) {
+		return explicitLanguage;
+	}
+
+	try {
+		const detection = await detectWhisperLanguage(model, processor, audio);
+		if (detection) {
+			return applyLanguageDetectionPriority(
+				detection.detectedLanguage,
+				detection.languageScores,
+				languagePriority,
+			);
+		}
+	} catch (err) {
+		console.warn("[Whisper] Language detection failed:", err);
+	}
+
+	return resolveWhisperLanguage(languagePriority) ?? "en";
+}
+
 function isWebGpuFailure(err) {
 	const message = String(err?.message ?? err ?? "");
 	return (
@@ -177,7 +292,47 @@ function switchToWasm() {
 	AutomaticSpeechRecognitionPipeline.reset();
 }
 
-let processing = false;
+let liveProcessing = false;
+let batchProcessing = false;
+
+const WHISPER_CHUNK_LENGTH_S = 30;
+const WHISPER_STRIDE_LENGTH_S = 5;
+
+async function buildWhisperTimestampChunks(processor, audio, samplingRate) {
+	const useChunking = audio.length > samplingRate * WHISPER_CHUNK_LENGTH_S;
+	const chunks = [];
+
+	if (useChunking) {
+		const window = samplingRate * WHISPER_CHUNK_LENGTH_S;
+		const stride = samplingRate * WHISPER_STRIDE_LENGTH_S;
+		const jump = window - 2 * stride;
+		let offset = 0;
+
+		while (true) {
+			const offsetEnd = offset + window;
+			const subarr = audio.subarray(offset, Math.min(offsetEnd, audio.length));
+			const feature = await processor(subarr);
+			const isFirst = offset === 0;
+			const isLast = offsetEnd >= audio.length;
+
+			chunks.push({
+				stride: [subarr.length, isFirst ? 0 : stride, isLast ? 0 : stride],
+				input_features: feature.input_features,
+			});
+
+			if (isLast) break;
+			offset += jump;
+		}
+	} else {
+		const feature = await processor(audio);
+		chunks.push({
+			stride: [audio.length, 0, 0],
+			input_features: feature.input_features,
+		});
+	}
+
+	return chunks;
+}
 
 export async function setWhisperModel(modelId, device = "wasm") {
 	currentModelId = modelId;
@@ -185,11 +340,17 @@ export async function setWhisperModel(modelId, device = "wasm") {
 	AutomaticSpeechRecognitionPipeline.reset();
 }
 
-export async function processWhisperMessage(audio, language, task = "transcribe", modelId = null) {
-	if (processing) return;
-	processing = true;
+export async function processWhisperMessage(
+	audio,
+	language,
+	task = "transcribe",
+	modelId = null,
+	languagePriority = null,
+) {
+	if (liveProcessing || batchProcessing) return;
+	liveProcessing = true;
 	if (!audio) {
-		processing = false;
+		liveProcessing = false;
 		return;
 	}
 
@@ -211,23 +372,113 @@ export async function processWhisperMessage(audio, language, task = "transcribe"
 			num_beams: 1,
 		};
 
-		const whisperLanguage = resolveWhisperLanguage(language);
+		const whisperLanguage = await resolveEffectiveWhisperLanguage(
+			model,
+			processor,
+			audio,
+			language,
+			languagePriority,
+		);
 		if (whisperLanguage) {
 			generateOptions.language = whisperLanguage;
 		}
 
 		const outputs = await model.generate(generateOptions);
 		const outputText = tokenizer.batch_decode(outputs, { skip_special_tokens: true });
-		processing = false;
+		liveProcessing = false;
 		return outputText;
 	} catch (err) {
 		if (isWebGpuFailure(err)) {
 			switchToWasm();
-			processing = false;
-			return processWhisperMessage(audio, language, task, modelId);
+			liveProcessing = false;
+			return processWhisperMessage(audio, language, task, modelId, languagePriority);
 		}
 
-		processing = false;
+		liveProcessing = false;
+		chrome.runtime.sendMessage({
+			type: "model-status",
+			data: { status: "error", message: String(err?.message ?? err) },
+		});
+		return null;
+	}
+}
+
+export async function processWhisperWithTimestamps(
+	audio,
+	language,
+	task = "transcribe",
+	modelId = null,
+	languagePriority = null,
+) {
+	if (batchProcessing || liveProcessing) return null;
+	batchProcessing = true;
+	if (!audio || audio.length === 0) {
+		batchProcessing = false;
+		return null;
+	}
+
+	try {
+		const [tokenizer, processor, model] = await AutomaticSpeechRecognitionPipeline.getInstance(
+			null,
+			modelId,
+		);
+
+		const samplingRate = processor.feature_extractor.config.sampling_rate ?? WHISPER_SAMPLE_RATE;
+		const hopLength = processor.feature_extractor.config.hop_length;
+		const timePrecision =
+			processor.feature_extractor.config.chunk_length / model.config.max_source_positions;
+
+		const whisperChunks = await buildWhisperTimestampChunks(processor, audio, samplingRate);
+		const durationSec = audio.length / samplingRate;
+		const maxNewTokens = Math.max(256, Math.ceil(durationSec * 8));
+
+		const whisperLanguage = await resolveEffectiveWhisperLanguage(
+			model,
+			processor,
+			audio,
+			language,
+			languagePriority,
+		);
+		const generateBase = {
+			max_new_tokens: maxNewTokens,
+			return_timestamps: true,
+			task,
+			do_sample: false,
+			num_beams: 1,
+		};
+		if (whisperLanguage) {
+			generateBase.language = whisperLanguage;
+		}
+
+		for (const chunk of whisperChunks) {
+			generateBase.num_frames = Math.floor(chunk.stride[0] / hopLength);
+			const data = await model.generate({
+				inputs: chunk.input_features,
+				...generateBase,
+			});
+			chunk.tokens = data[0].tolist();
+			chunk.stride = chunk.stride.map((value) => value / samplingRate);
+		}
+
+		const [fullText, optional] = tokenizer._decode_asr(whisperChunks, {
+			return_timestamps: true,
+			time_precision: timePrecision,
+			force_full_sequences: true,
+		});
+
+		batchProcessing = false;
+		return {
+			text: fullText,
+			chunks: optional?.chunks ?? [],
+		};
+	} catch (err) {
+		if (isWebGpuFailure(err)) {
+			switchToWasm();
+			batchProcessing = false;
+			return processWhisperWithTimestamps(audio, language, task, modelId, languagePriority);
+		}
+
+		batchProcessing = false;
 		chrome.runtime.sendMessage({
 			type: "model-status",
 			data: { status: "error", message: String(err?.message ?? err) },

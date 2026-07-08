@@ -18,6 +18,25 @@ export const MODEL_IDS: Record<WhisperModel, string> = {
 	medium: "onnx-community/whisper-medium",
 };
 
+export function getWhisperModelLabelFromId(
+	modelId: string | null | undefined,
+): string | undefined {
+	if (!modelId) return undefined;
+	const match = (Object.entries(MODEL_IDS) as [WhisperModel, string][]).find(
+		([key, id]) => key !== "auto" && id === modelId,
+	);
+	return match ? WHISPER_MODELS[match[0]] : modelId;
+}
+
+export function getWhisperModelTooltipLabel(
+	loadedModelId: string | null | undefined,
+	whisperModel: WhisperModel,
+): string {
+	const loadedLabel = getWhisperModelLabelFromId(loadedModelId);
+	if (loadedLabel) return loadedLabel;
+	return WHISPER_MODELS[whisperModel];
+}
+
 export const LANGUAGES = {
 	en: "english",
 	zh: "chinese",
@@ -121,6 +140,18 @@ export const LANGUAGES = {
 } as const;
 
 export type TranscriptionLanguage = (typeof LANGUAGES)[keyof typeof LANGUAGES];
+
+/** Locale hint for auto-detect only (not shown in the language dropdown). */
+export function getLanguageDetectionPriority(): string | null {
+	if (typeof navigator === "undefined") return "ru";
+
+	const localeCode = navigator.language.split("-")[0]?.toLowerCase();
+	if (localeCode === "ru" || localeCode === "uk" || localeCode === "be" || localeCode === "kk") {
+		return "ru";
+	}
+
+	return null;
+}
 export type TranscriptionTask = "transcribe" | "translate";
 export type TranscriptionMode = "transcribe" | "translate";
 export const TRANSLATE_TARGET_LANGUAGES = ["english"] as const;
@@ -132,11 +163,14 @@ export type TranscriptionSettings = {
 	translateTargetLanguage: TranslateTargetLanguage | null;
 	includeMicrophone: boolean;
 	autoscroll: boolean;
+	speakerDetection: boolean;
 	summarizationLanguage: TranscriptionLanguage;
 	whisperModel: WhisperModel;
 };
 
 export const TRANSCRIPTION_SETTINGS_KEY = "transcriptionSettings";
+
+const SETTINGS_STORAGE_VERSION = 5;
 
 export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
 	mode: "transcribe",
@@ -144,26 +178,83 @@ export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
 	translateTargetLanguage: "english",
 	includeMicrophone: false,
 	autoscroll: true,
+	speakerDetection: false,
 	summarizationLanguage: "english" as TranscriptionLanguage,
 	whisperModel: "auto",
 };
+
+function resolveTranscribeLanguage(
+	stored: Record<string, unknown>,
+	storageVersion: number,
+): TranscriptionLanguage | null {
+	if (storageVersion < SETTINGS_STORAGE_VERSION) {
+		return null;
+	}
+
+	if (stored.transcribeLanguage === null) {
+		return null;
+	}
+
+	if (typeof stored.transcribeLanguage === "string") {
+		return stored.transcribeLanguage as TranscriptionLanguage;
+	}
+
+	return null;
+}
+
+function resolveStoredSettings(stored: Record<string, unknown>): Pick<
+	TranscriptionSettings,
+	"speakerDetection" | "mode" | "transcribeLanguage"
+> {
+	const storageVersion =
+		typeof stored.settingsVersion === "number" ? stored.settingsVersion : 1;
+
+	if (storageVersion < SETTINGS_STORAGE_VERSION) {
+		return {
+			speakerDetection: false,
+			mode: "transcribe",
+			transcribeLanguage: resolveTranscribeLanguage(stored, storageVersion),
+		};
+	}
+
+	return {
+		speakerDetection: stored.speakerDetection === true,
+		mode: stored.mode === "translate" ? "translate" : "transcribe",
+		transcribeLanguage: resolveTranscribeLanguage(stored, storageVersion),
+	};
+}
 
 export function migrateTranscriptionSettings(stored: unknown): TranscriptionSettings {
 	if (!stored || typeof stored !== "object") return DEFAULT_TRANSCRIPTION_SETTINGS;
 	const s = stored as Record<string, unknown>;
 	if ("language" in s && !("mode" in s)) {
-		const lang = s.language as string;
-		const base = lang?.includes("/") ? lang.split("/")[0].trim() : lang;
 		return {
 			...DEFAULT_TRANSCRIPTION_SETTINGS,
-			mode: base === "english" ? "transcribe" : "translate",
-			transcribeLanguage: base === "english" ? (lang as TranscriptionLanguage) : null,
+			mode: "transcribe",
+			transcribeLanguage: null,
 			translateTargetLanguage: "english",
 			includeMicrophone: Boolean(s.includeMicrophone),
 			summarizationLanguage: (s.language as TranscriptionLanguage) ?? "english",
+			speakerDetection: false,
 		};
 	}
-	return { ...DEFAULT_TRANSCRIPTION_SETTINGS, ...s } as TranscriptionSettings;
+
+	const { settingsVersion: _version, ...rest } = s;
+	const resolved = resolveStoredSettings(s);
+
+	return {
+		...DEFAULT_TRANSCRIPTION_SETTINGS,
+		...rest,
+		mode: resolved.mode,
+		speakerDetection: resolved.speakerDetection,
+		transcribeLanguage: resolved.transcribeLanguage,
+	} as TranscriptionSettings;
+}
+
+export function persistTranscriptionSettings(
+	settings: TranscriptionSettings,
+): TranscriptionSettings & { settingsVersion: number } {
+	return { ...settings, settingsVersion: SETTINGS_STORAGE_VERSION };
 }
 
 export async function loadTranscriptionSettings(): Promise<TranscriptionSettings> {

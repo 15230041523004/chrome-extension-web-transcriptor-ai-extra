@@ -13,9 +13,11 @@ import {
 	TRANSLATE_TARGET_LANGUAGES as _TRANSLATE_TARGET_LANGUAGES,
 	WHISPER_MODELS,
 	type WhisperModel,
+	getWhisperModelTooltipLabel,
 } from "./jotai/settingAtom";
 import { useAtom } from "jotai";
 import {
+	loadedModelIdAtom,
 	modelLoadingProgressAtom,
 	modelStatusAtom,
 } from "./jotai/modelStatusAtom";
@@ -37,6 +39,7 @@ const SidePanelApp: React.FC = () => {
 	const [transcription, setTranscription] = useState("");
 	const [modelStatus, setModelStatus] = useAtom(modelStatusAtom);
 	const [loadingProgress, setLoadingProgress] = useAtom(modelLoadingProgressAtom);
+	const [loadedModelId, setLoadedModelId] = useAtom(loadedModelIdAtom);
 	const [isRecording, setIsRecording] = useState(false);
 	const [activeTabId, setActiveTabId] = useState<number | null>(null);
 	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
@@ -134,10 +137,17 @@ const SidePanelApp: React.FC = () => {
 				const next = (message.data?.transcripted ?? "").trim();
 				if (!next) return;
 				setTranscription((prev) => (prev ? `${prev}\n${next}` : next));
+			} else if (message.type === "transcript-diarized") {
+				const next = (message.data?.transcripted ?? "").trim();
+				if (!next) return;
+				setTranscription(next);
 			} else if (message.type === "model-status") {
 				const status = message.data?.status;
 				setModelStatus(
-					status === "loading" || status === "ready" || status === "error"
+					status === "loading" ||
+						status === "ready" ||
+						status === "error" ||
+						status === "diarizing"
 						? status
 						: "unknown",
 				);
@@ -145,8 +155,11 @@ const SidePanelApp: React.FC = () => {
 					setModelError(typeof message.data?.message === "string" ? message.data.message : "Ошибка модели (см. консоль)");
 					setTimeout(() => setModelError(null), 8000);
 				}
-				if (message.data?.status === "loading") {
+				if (status === "loading" || status === "diarizing") {
 					setLoadingProgress(normalizeModelProgress(message.data?.progress));
+				}
+				if (typeof message.data?.modelId === "string") {
+					setLoadedModelId(message.data.modelId);
 				}
 			} else if (message.type === "recording-state") {
 				setIsRecording(message.data?.recording ?? false);
@@ -161,7 +174,7 @@ const SidePanelApp: React.FC = () => {
 			chrome.tabs.onActivated.removeListener(onTabActivated);
 			chrome.tabs.onUpdated.removeListener(onTabUpdated);
 		};
-	}, [setModelStatus, setLoadingProgress]);
+	}, [setModelStatus, setLoadingProgress, setLoadedModelId]);
 
 	useEffect(() => {
 		if (!transcriptionSettings.autoscroll) return;
@@ -195,6 +208,16 @@ const SidePanelApp: React.FC = () => {
 		return "tiny";
 	};
 
+	const isModelBusy = modelStatus === "loading" || modelStatus === "diarizing";
+
+	const modelStatusLabel =
+		modelStatus === "diarizing" ? "Processing speakers..." : modelStatus;
+
+	const modelStatusTooltip = getWhisperModelTooltipLabel(
+		loadedModelId,
+		transcriptionSettings.whisperModel,
+	);
+
 	const handleModelChange = (newModel: WhisperModel) => {
 		let finalModel = newModel;
 		if (newModel === "auto") {
@@ -209,7 +232,29 @@ const SidePanelApp: React.FC = () => {
 	return (
 		<div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background">
 			<section className="flex min-h-0 flex-1 flex-col px-2 pt-2 pb-1">
-				<h1 className="shrink-0 text-base font-semibold">Transcription</h1>
+				<div className="flex shrink-0 items-center gap-3">
+					<h1 className="shrink-0 text-base font-semibold">Transcription</h1>
+					<p
+						className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground"
+						title={modelStatusTooltip}
+					>
+						<span className="font-medium text-foreground">Model Status: </span>
+						{modelStatusLabel}
+						{modelStatus === "loading" && ` (${loadingProgress}% loaded)`}
+						{modelStatus === "diarizing" && loadingProgress > 0 && ` (${loadingProgress}%)`}
+					</p>
+					<label className="flex shrink-0 cursor-pointer items-center gap-2">
+						<input
+							type="checkbox"
+							checked={transcriptionSettings.autoscroll}
+							onChange={(e) =>
+								setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
+							}
+							className="rounded"
+						/>
+						<span className="text-sm">Autoscroll</span>
+					</label>
+				</div>
 				<Textarea
 					ref={transcriptionRef}
 					value={transcription}
@@ -258,26 +303,6 @@ const SidePanelApp: React.FC = () => {
 
 			{showMoreSettings && (
 				<div className="max-h-[45vh] shrink-0 overflow-y-auto border-t border-border px-2 py-2">
-					<label className="mb-3 flex cursor-pointer items-center gap-2">
-						<input
-							type="checkbox"
-							checked={transcriptionSettings.autoscroll}
-							onChange={(e) =>
-								setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
-							}
-							className="rounded"
-						/>
-						<span className="text-sm">Autoscroll</span>
-					</label>
-
-					<div className="mb-2 text-sm">
-						<span className="font-medium">Model Status: </span>
-						<span className="text-muted-foreground">{modelStatus}</span>
-						{modelStatus === "loading" && (
-							<span className="text-muted-foreground"> ({loadingProgress}% loaded)</span>
-						)}
-					</div>
-
 					<div className="mb-2">
 						<span className="mb-1 block text-sm font-medium">Transcription Mode</span>
 						<div className="flex gap-4">
@@ -285,7 +310,7 @@ const SidePanelApp: React.FC = () => {
 								<input
 									type="radio"
 									name="mode"
-									checked={transcriptionSettings.mode === "transcribe"}
+									checked={(transcriptionSettings.mode ?? "transcribe") === "transcribe"}
 									onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "transcribe" }))}
 								/>
 								<span className="text-sm">Transcribe</span>
@@ -310,7 +335,11 @@ const SidePanelApp: React.FC = () => {
 								setLanguage={(lang) => setTranscriptionSettings((prev) => ({ ...prev, transcribeLanguage: lang }))}
 								includeAuto
 							/>
-							<p className="mt-1 text-xs text-muted-foreground">Output in the same language as input</p>
+							<p className="mt-1 text-xs text-muted-foreground">
+								{transcriptionSettings.transcribeLanguage === null
+									? "Auto-detects language from audio (Russian preferred when ambiguous)"
+									: "Output in the same language as input"}
+							</p>
 						</div>
 					)}
 
@@ -364,6 +393,7 @@ const SidePanelApp: React.FC = () => {
 						<input
 							type="checkbox"
 							checked={transcriptionSettings.includeMicrophone ?? false}
+							disabled={isRecording || isModelBusy}
 							onChange={(e) =>
 								setTranscriptionSettings((prev) => ({ ...prev, includeMicrophone: e.target.checked }))
 							}
@@ -373,6 +403,24 @@ const SidePanelApp: React.FC = () => {
 					</label>
 					<p className="mb-3 text-xs text-muted-foreground">
 						Mix your voice with tab audio for transcription
+					</p>
+
+					<label className="mb-1 flex cursor-pointer items-center gap-2">
+						<input
+							type="checkbox"
+							checked={transcriptionSettings.speakerDetection ?? false}
+							disabled={isRecording || isModelBusy}
+							onChange={(e) =>
+								setTranscriptionSettings((prev) => ({ ...prev, speakerDetection: e.target.checked }))
+							}
+							className="rounded"
+						/>
+						<span className="text-sm">Speaker detection (Beta)</span>
+					</label>
+					<p className="mb-3 text-xs text-muted-foreground">
+						After Stop, detects speech turns (pauses) and labels 2 speakers. Speaker 1 is usually
+						the person who talks the most. Best for interview-style dialogue with two distinct
+						voices. Enable before Start.
 					</p>
 
 					<p className="mb-3 text-xs text-muted-foreground">
@@ -400,15 +448,21 @@ const SidePanelApp: React.FC = () => {
 				</div>
 			)}
 
+			{modelStatus === "diarizing" && (
+				<div className="mx-2 mb-1 shrink-0 rounded border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
+					Processing speakers… This may take a minute after Stop.
+				</div>
+			)}
+
 			<footer className="shrink-0 space-y-2 border-t border-border p-2">
 				<div className="flex gap-2">
 					<Button
 						className="flex-1"
 						variant={isRecording ? "outline" : "default"}
-						disabled={isRecording}
+						disabled={isRecording || isModelBusy}
 						onClick={handleStartTranscription}
 					>
-						{isRecording ? "Recording..." : "Start"}
+						{isRecording ? "Recording..." : isModelBusy ? "Please wait..." : "Start"}
 					</Button>
 					<Button
 						className="flex-1"
