@@ -1,11 +1,11 @@
 import type React from "react";
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, SlidersHorizontal } from "lucide-react";
+import { FileText, SlidersHorizontal, Sparkles } from "lucide-react";
 import { AiSummarizer } from "./components/ai-summarizer";
 import { Button } from "./components/ui/button";
 import { Textarea } from "./components/ui/textarea";
 import { useToast } from "./components/ui/use-toast";
-import { summarizeWebPage } from "./summarizer";
+import { summarizeTranscription, summarizeWebPage } from "./summarizer";
 import { LanguageSelector } from "./components/LanguageSelector";
 import {
 	type TranscriptionLanguage,
@@ -21,21 +21,23 @@ import {
 	modelLoadingProgressAtom,
 	modelStatusAtom,
 } from "./jotai/modelStatusAtom";
+import { getAiSummarizationStatus } from "./lib/chromeAi";
+import { DebugPanel } from "./components/debug-panel";
+import { debugError, debugLog } from "./lib/debugLog";
 import { normalizeModelProgress } from "./lib/modelProgress";
 
-const fetchAiCapabilities = async () => {
-	if (!window.ai) {
-		return { available: "no" };
-	}
-	const { available } = await window.ai.languageModel.capabilities();
-	return { available };
-};
+type ActivePanel = "transcript" | "ai" | "more";
+type SecondaryView = "transcript" | "ai";
 
 const SidePanelApp: React.FC = () => {
+	debugLog("side-panel-app", "Component render start");
 	const [summary, setSummary] = useState("");
 	const [transcriptionSettings, setTranscriptionSettings] = useAtom(transcriptionSettingsAtom);
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
-	const [aiCapabilities, setAiCapabilities] = useState<{ available: string }>({ available: "no" });
+	const [aiStatus, setAiStatus] = useState({
+		available: false,
+		downloading: false,
+	});
 	const [transcription, setTranscription] = useState("");
 	const [modelStatus, setModelStatus] = useAtom(modelStatusAtom);
 	const [loadingProgress, setLoadingProgress] = useAtom(modelLoadingProgressAtom);
@@ -45,8 +47,13 @@ const SidePanelApp: React.FC = () => {
 	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 	const [captureError, setCaptureError] = useState<string | null>(null);
 	const [modelError, setModelError] = useState<string | null>(null);
-	const [showMoreSettings, setShowMoreSettings] = useState(false);
+	const [activePanel, setActivePanel] = useState<ActivePanel>("transcript");
+	const [secondaryView, setSecondaryView] = useState<SecondaryView>("transcript");
 	const transcriptionRef = useRef<HTMLTextAreaElement>(null);
+
+	const selectPanel = (panel: ActivePanel) => {
+		setActivePanel((current) => (current === panel && panel !== "transcript" ? "transcript" : panel));
+	};
 
 	const isCapturableUrl = (url: string | undefined): boolean => {
 		if (!url) return false;
@@ -71,35 +78,28 @@ const SidePanelApp: React.FC = () => {
 		});
 	};
 
-	const handleStartTranscription = () => {
-		if (isRecording) {
-			chrome.runtime.sendMessage({ type: "stop-transcription" });
-			return;
-		}
-
-		if (activeTabId === null) {
-			setCaptureError("Не удалось определить активную вкладку. Переключитесь на вкладку с аудио и попробуйте снова.");
-			return;
-		}
-
-		if (!isCapturableUrl(activeTabUrl)) {
-			setCaptureError(
-				`Нельзя захватить эту страницу (${activeTabUrl ?? "unknown"}). Откройте YouTube и кликните иконку расширения на вкладке с видео.`,
-			);
-			return;
-		}
-
-		chrome.runtime.sendMessage({ type: "prepare-capture", target: "offscreen" });
-		chrome.tabCapture.getMediaStreamId({ targetTabId: activeTabId }, (streamId) => {
+	const requestCaptureForTab = (tabId: number, retrying = false) => {
+		debugLog("capture", "requestCaptureForTab", { tabId, retrying });
+		chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
 			const captureError = chrome.runtime.lastError;
 			if (captureError || !streamId) {
 				const detail = captureError?.message ?? "unknown error";
+				if (!retrying && detail.includes("active stream")) {
+					chrome.runtime.sendMessage({ type: "release-capture" }, () => {
+						window.setTimeout(() => requestCaptureForTab(tabId, true), 600);
+					});
+					return;
+				}
 				if (detail.includes("not been invoked") || detail.includes("activeTab")) {
 					setCaptureError(
-						"Chrome разрешает захват только при клике по иконке расширения на вкладке с видео. Закройте side panel, откройте YouTube и кликните иконку.",
+						"Chrome only allows capture when you click the extension icon on the tab with video. Close the side panel, open YouTube, and click the icon on that tab.",
+					);
+				} else if (detail.includes("active stream")) {
+					setCaptureError(
+						"This tab is already being captured. Press Stop, wait a second, and try again.",
 					);
 				} else {
-					setCaptureError(`Захват отклонён: ${detail}`);
+					setCaptureError(`Capture rejected: ${detail}`);
 				}
 				return;
 			}
@@ -108,10 +108,42 @@ const SidePanelApp: React.FC = () => {
 		});
 	};
 
-	useEffect(() => {
-		fetchAiCapabilities().then((capabilities) => {
-			setAiCapabilities(capabilities);
+	const handleStartTranscription = () => {
+		if (isRecording) {
+			chrome.runtime.sendMessage({ type: "stop-transcription" });
+			return;
+		}
+
+		if (activeTabId === null) {
+			setCaptureError("Could not detect the active tab. Switch to the tab with audio and try again.");
+			return;
+		}
+
+		if (!isCapturableUrl(activeTabUrl)) {
+			setCaptureError(
+				`Cannot capture this page (${activeTabUrl ?? "unknown"}). Open YouTube and click the extension icon on the video tab.`,
+			);
+			return;
+		}
+
+		chrome.runtime.sendMessage({ type: "release-capture" }, () => {
+			requestCaptureForTab(activeTabId);
 		});
+	};
+
+	useEffect(() => {
+		debugLog("side-panel-app", "useEffect mount");
+		getAiSummarizationStatus()
+			.then((status) => {
+				debugLog("side-panel-app", "AI summarization status", status);
+				setAiStatus({
+					available: status.available,
+					downloading: status.downloading,
+				});
+			})
+			.catch((error) => {
+				debugError("side-panel-app", "getAiSummarizationStatus failed", error);
+			});
 
 		refreshActiveTab();
 		const onTabActivated = () => refreshActiveTab();
@@ -133,6 +165,7 @@ const SidePanelApp: React.FC = () => {
 		);
 
 		const messageListener = (message: any) => {
+			debugLog("side-panel-app", "runtime message", message?.type ?? message);
 			if (message.type === "transcript") {
 				const next = (message.data?.transcripted ?? "").trim();
 				if (!next) return;
@@ -152,7 +185,7 @@ const SidePanelApp: React.FC = () => {
 						: "unknown",
 				);
 				if (status === "error") {
-					setModelError(typeof message.data?.message === "string" ? message.data.message : "Ошибка модели (см. консоль)");
+					setModelError(typeof message.data?.message === "string" ? message.data.message : "Model error (see console)");
 					setTimeout(() => setModelError(null), 8000);
 				}
 				if (status === "loading" || status === "diarizing") {
@@ -164,17 +197,38 @@ const SidePanelApp: React.FC = () => {
 			} else if (message.type === "recording-state") {
 				setIsRecording(message.data?.recording ?? false);
 			} else if (message.type === "capture-error") {
-				setCaptureError(typeof message.data?.error === "string" ? message.data.error : String(message.data?.error || "Неизвестная ошибка"));
+				setCaptureError(typeof message.data?.error === "string" ? message.data.error : String(message.data?.error || "Unknown error"));
 				setTimeout(() => setCaptureError(null), 8000);
 			}
 		};
 		chrome.runtime.onMessage.addListener(messageListener);
 		return () => {
+			debugLog("side-panel-app", "useEffect cleanup");
 			chrome.runtime.onMessage.removeListener(messageListener);
 			chrome.tabs.onActivated.removeListener(onTabActivated);
 			chrome.tabs.onUpdated.removeListener(onTabUpdated);
 		};
 	}, [setModelStatus, setLoadingProgress, setLoadedModelId]);
+
+	useEffect(() => {
+		debugLog("side-panel-app", "UI state snapshot", {
+			activePanel,
+			activeTabId,
+			activeTabUrl,
+			isRecording,
+			modelStatus,
+			transcriptionLength: transcription.length,
+			aiAvailable: aiStatus.available,
+		});
+	}, [
+		activePanel,
+		activeTabId,
+		activeTabUrl,
+		isRecording,
+		modelStatus,
+		transcription.length,
+		aiStatus.available,
+	]);
 
 	useEffect(() => {
 		if (!transcriptionSettings.autoscroll) return;
@@ -186,10 +240,20 @@ const SidePanelApp: React.FC = () => {
 
 	const { toast } = useToast();
 
+	const canSummarize =
+		transcriptionSettings.summarizationSource === "webpage" ||
+		transcription.trim().length > 0;
+
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
-			const result = await summarizeWebPage(transcriptionSettings.summarizationLanguage);
+			const result =
+				transcriptionSettings.summarizationSource === "transcription"
+					? await summarizeTranscription(
+							transcription,
+							transcriptionSettings.summarizationLanguage,
+						)
+					: await summarizeWebPage(transcriptionSettings.summarizationLanguage);
 			setSummary(result);
 			toast({ description: "Summarized", color: "success" });
 		} catch (error) {
@@ -229,232 +293,313 @@ const SidePanelApp: React.FC = () => {
 		}));
 	};
 
-	return (
-		<div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background">
-			<section className="flex min-h-0 flex-1 flex-col px-2 pt-2 pb-1">
-				<div className="flex shrink-0 items-center gap-3">
-					<h1 className="shrink-0 text-base font-semibold">Transcription</h1>
-					<p
-						className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground"
-						title={modelStatusTooltip}
-					>
-						<span className="font-medium text-foreground">Model Status: </span>
-						{modelStatusLabel}
-						{modelStatus === "loading" && ` (${loadingProgress}% loaded)`}
-						{modelStatus === "diarizing" && loadingProgress > 0 && ` (${loadingProgress}%)`}
+	const renderTranscriptionPanel = (compact = false) => (
+		<section className="flex min-h-0 flex-1 flex-col px-2 py-2">
+			<div className="flex shrink-0 items-center gap-2">
+				{!compact && <h1 className="shrink-0 text-base font-semibold">Transcription</h1>}
+				<p
+					className="min-w-0 flex-1 truncate text-center text-xs text-muted-foreground"
+					title={modelStatusTooltip}
+				>
+					<span className="font-medium text-foreground">Model Status: </span>
+					{modelStatusLabel}
+					{modelStatus === "loading" && ` (${loadingProgress}% loaded)`}
+					{modelStatus === "diarizing" && loadingProgress > 0 && ` (${loadingProgress}%)`}
+				</p>
+				<label className="flex shrink-0 cursor-pointer items-center gap-2">
+					<input
+						type="checkbox"
+						checked={transcriptionSettings.autoscroll}
+						onChange={(e) =>
+							setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
+						}
+						className="rounded"
+					/>
+					<span className="text-sm">Autoscroll</span>
+				</label>
+			</div>
+			<Textarea
+				ref={transcriptionRef}
+				value={transcription}
+				readOnly
+				className="mt-1 min-h-0 flex-1 resize-none"
+			/>
+		</section>
+	);
+
+	const renderAiPanel = (fillHeight = false) => (
+		<div className={fillHeight ? "flex min-h-0 flex-1 flex-col px-2 py-2" : "px-2 py-2"}>
+			{!aiStatus.available ? (
+				<div className="text-center text-sm">
+					<p className="font-medium">AI Summarization is not available</p>
+					<p className="text-xs text-muted-foreground">
+						Use Chrome or Brave 138+ with on-device AI (Gemini Nano) enabled in browser settings.
 					</p>
-					<label className="flex shrink-0 cursor-pointer items-center gap-2">
+				</div>
+			) : (
+				<>
+					{aiStatus.downloading && (
+						<p className="mb-2 text-xs text-muted-foreground">
+							On-device AI model is downloading. The first summary may take longer.
+						</p>
+					)}
+					<AiSummarizer
+						language={transcriptionSettings.summarizationLanguage}
+						setLanguage={(language: TranscriptionLanguage) =>
+							setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
+						}
+						source={transcriptionSettings.summarizationSource}
+						setSource={(source) =>
+							setTranscriptionSettings((prev) => ({ ...prev, summarizationSource: source }))
+						}
+						isSummaryLoading={isSummaryLoading}
+						handleSummarize={handleSummarize}
+						summary={summary}
+						canSummarize={canSummarize && !isRecording && !isModelBusy}
+						hideTitle
+						fillHeight={fillHeight}
+					/>
+				</>
+			)}
+		</div>
+	);
+
+	const renderMoreSettings = () => (
+		<>
+			<label className="mb-3 flex cursor-pointer items-center gap-2">
+				<input
+					type="checkbox"
+					checked={transcriptionSettings.autoscroll}
+					onChange={(e) =>
+						setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
+					}
+					className="rounded"
+				/>
+				<span className="text-sm">Autoscroll</span>
+			</label>
+
+			<div className="mb-2">
+				<span className="mb-1 block text-sm font-medium">Transcription Mode</span>
+				<div className="flex gap-4">
+					<label className="flex cursor-pointer items-center gap-2">
 						<input
-							type="checkbox"
-							checked={transcriptionSettings.autoscroll}
-							onChange={(e) =>
-								setTranscriptionSettings((prev) => ({ ...prev, autoscroll: e.target.checked }))
-							}
-							className="rounded"
+							type="radio"
+							name="mode"
+							checked={(transcriptionSettings.mode ?? "transcribe") === "transcribe"}
+							onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "transcribe" }))}
 						/>
-						<span className="text-sm">Autoscroll</span>
+						<span className="text-sm">Transcribe</span>
+					</label>
+					<label className="flex cursor-pointer items-center gap-2">
+						<input
+							type="radio"
+							name="mode"
+							checked={transcriptionSettings.mode === "translate"}
+							onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "translate" }))}
+						/>
+						<span className="text-sm">Translate</span>
 					</label>
 				</div>
-				<Textarea
-					ref={transcriptionRef}
-					value={transcription}
-					readOnly
-					className="mt-1 min-h-0 flex-1 resize-none"
+			</div>
+
+			{transcriptionSettings.mode === "transcribe" && (
+				<div className="mb-2">
+					<span className="mb-1 block text-sm font-medium">Source Language</span>
+					<LanguageSelector
+						language={transcriptionSettings.transcribeLanguage}
+						setLanguage={(lang) => setTranscriptionSettings((prev) => ({ ...prev, transcribeLanguage: lang }))}
+						includeAuto
+					/>
+					<p className="mt-1 text-xs text-muted-foreground">
+						{transcriptionSettings.transcribeLanguage === null
+							? "Auto-detects language from audio (Russian preferred when ambiguous)"
+							: "Output in the same language as input"}
+					</p>
+				</div>
+			)}
+
+			{transcriptionSettings.mode === "translate" && (
+				<div className="mb-2">
+					<label htmlFor="translate-target-language" className="mb-1 block text-sm font-medium">
+						Target Language
+					</label>
+					<select
+						id="translate-target-language"
+						className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
+						value={transcriptionSettings.translateTargetLanguage ?? "english"}
+						onChange={(e) =>
+							setTranscriptionSettings((prev) => ({
+								...prev,
+								translateTargetLanguage: e.target.value as "english",
+							}))
+						}
+					>
+						{_TRANSLATE_TARGET_LANGUAGES.map((lang) => (
+							<option key={lang} value={lang}>
+								{lang.charAt(0).toUpperCase() + lang.slice(1)}
+							</option>
+						))}
+					</select>
+					<p className="mt-1 text-xs text-muted-foreground">
+						Translate audio to English (Whisper limitation)
+					</p>
+				</div>
+			)}
+
+			<div className="mb-3">
+				<span className="mb-1 block text-sm font-medium">AI Model</span>
+				<select
+					value={transcriptionSettings.whisperModel}
+					onChange={(e) => handleModelChange(e.target.value as WhisperModel)}
+					className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
+				>
+					{Object.entries(WHISPER_MODELS).map(([key, label]) => (
+						<option key={key} value={key}>
+							{label}
+						</option>
+					))}
+				</select>
+				<p className="mt-1 text-xs text-muted-foreground">
+					Auto picks the best model for your device. Base is recommended for stability.
+				</p>
+			</div>
+
+			<label className="mb-1 flex cursor-pointer items-center gap-2">
+				<input
+					type="checkbox"
+					checked={transcriptionSettings.includeMicrophone ?? false}
+					disabled={isRecording || isModelBusy}
+					onChange={(e) =>
+						setTranscriptionSettings((prev) => ({ ...prev, includeMicrophone: e.target.checked }))
+					}
+					className="rounded"
 				/>
-			</section>
+				<span className="text-sm">Include microphone</span>
+			</label>
+			<p className="mb-3 text-xs text-muted-foreground">
+				Mix your voice with tab audio for transcription
+			</p>
+
+			<label className="mb-1 flex cursor-pointer items-center gap-2">
+				<input
+					type="checkbox"
+					checked={transcriptionSettings.speakerDetection ?? false}
+					disabled={isRecording || isModelBusy}
+					onChange={(e) =>
+						setTranscriptionSettings((prev) => ({ ...prev, speakerDetection: e.target.checked }))
+					}
+					className="rounded"
+				/>
+				<span className="text-sm">Speaker detection (Beta)</span>
+			</label>
+			<p className="mb-3 text-xs text-muted-foreground">
+				After Stop, detects speech turns (pauses) and labels 2 speakers. Speaker 1 is usually
+				the person who talks the most. Best for interview-style dialogue with two distinct
+				voices. Enable before Start.
+			</p>
+
+			<p className="text-xs text-muted-foreground">
+				For reliable capture: close the side panel, open YouTube, and click the extension icon on the
+				tab with video.
+			</p>
+		</>
+	);
+
+	debugLog("side-panel-app", "Component render return");
+
+	return (
+		<div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
+			<div className="grid shrink-0 grid-cols-3 gap-1 border-b border-border p-2">
+				<Button
+					type="button"
+					variant={activePanel === "transcript" ? "default" : "outline"}
+					onClick={() => selectPanel("transcript")}
+					className="h-auto gap-1.5 px-2 py-2 text-xs"
+				>
+					<FileText className="h-4 w-4 shrink-0" aria-hidden="true" />
+					<span>Transcript</span>
+				</Button>
+				<Button
+					type="button"
+					variant={activePanel === "ai" ? "default" : "outline"}
+					onClick={() => selectPanel("ai")}
+					className="h-auto gap-1.5 px-2 py-2 text-xs"
+				>
+					<Sparkles className="h-4 w-4 shrink-0" aria-hidden="true" />
+					<span>Summary</span>
+				</Button>
+				<Button
+					type="button"
+					variant={activePanel === "more" ? "default" : "outline"}
+					onClick={() => selectPanel("more")}
+					className="h-auto gap-1.5 px-2 py-2 text-xs"
+				>
+					<SlidersHorizontal className="h-4 w-4 shrink-0" aria-hidden="true" />
+					<span>Options</span>
+				</Button>
+			</div>
 
 			{captureError && (
-				<div className="mx-2 mb-1 shrink-0 rounded border border-red-700 bg-red-900/30 p-2 text-xs text-red-200">
+				<div
+					role="alert"
+					className="mx-2 mt-2 shrink-0 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm leading-snug text-destructive dark:border-red-700 dark:bg-red-950/50 dark:text-red-100"
+				>
 					{captureError}
 				</div>
 			)}
 			{modelError && (
-				<div className="mx-2 mb-1 shrink-0 rounded border border-orange-700 bg-orange-900/30 p-2 text-xs text-orange-200">
+				<div
+					role="alert"
+					className="mx-2 mt-2 shrink-0 rounded-md border border-amber-600/50 bg-amber-500/15 p-3 text-sm leading-snug text-amber-950 dark:border-orange-700 dark:bg-orange-950/50 dark:text-orange-100"
+				>
 					{modelError}
 				</div>
 			)}
-
-			<div className="shrink-0 border-t border-border px-2 py-2">
-				<Button
-					type="button"
-					variant="outline"
-					onClick={() => setShowMoreSettings((open) => !open)}
-					aria-expanded={showMoreSettings}
-					className="h-auto w-full justify-between gap-3 px-3 py-2.5 text-left"
-				>
-					<span className="flex min-w-0 items-center gap-2.5">
-						<SlidersHorizontal className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-						<span className="flex min-w-0 flex-col">
-							<span className="text-sm font-semibold text-foreground">
-								{showMoreSettings ? "Less" : "More..."}
-							</span>
-							<span className="truncate text-xs font-normal text-muted-foreground">
-								{showMoreSettings ? "Hide language, model & options" : "Language, model & options"}
-							</span>
-						</span>
-					</span>
-					{showMoreSettings ? (
-						<ChevronUp className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
-					) : (
-						<ChevronDown className="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
-					)}
-				</Button>
-			</div>
-
-			{showMoreSettings && (
-				<div className="max-h-[45vh] shrink-0 overflow-y-auto border-t border-border px-2 py-2">
-					<div className="mb-2">
-						<span className="mb-1 block text-sm font-medium">Transcription Mode</span>
-						<div className="flex gap-4">
-							<label className="flex cursor-pointer items-center gap-2">
-								<input
-									type="radio"
-									name="mode"
-									checked={(transcriptionSettings.mode ?? "transcribe") === "transcribe"}
-									onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "transcribe" }))}
-								/>
-								<span className="text-sm">Transcribe</span>
-							</label>
-							<label className="flex cursor-pointer items-center gap-2">
-								<input
-									type="radio"
-									name="mode"
-									checked={transcriptionSettings.mode === "translate"}
-									onChange={() => setTranscriptionSettings((prev) => ({ ...prev, mode: "translate" }))}
-								/>
-								<span className="text-sm">Translate</span>
-							</label>
-						</div>
-					</div>
-
-					{transcriptionSettings.mode === "transcribe" && (
-						<div className="mb-2">
-							<span className="mb-1 block text-sm font-medium">Source Language</span>
-							<LanguageSelector
-								language={transcriptionSettings.transcribeLanguage}
-								setLanguage={(lang) => setTranscriptionSettings((prev) => ({ ...prev, transcribeLanguage: lang }))}
-								includeAuto
-							/>
-							<p className="mt-1 text-xs text-muted-foreground">
-								{transcriptionSettings.transcribeLanguage === null
-									? "Auto-detects language from audio (Russian preferred when ambiguous)"
-									: "Output in the same language as input"}
-							</p>
-						</div>
-					)}
-
-					{transcriptionSettings.mode === "translate" && (
-						<div className="mb-2">
-							<label htmlFor="translate-target-language" className="mb-1 block text-sm font-medium">
-								Target Language
-							</label>
-							<select
-								id="translate-target-language"
-								className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
-								value={transcriptionSettings.translateTargetLanguage ?? "english"}
-								onChange={(e) =>
-									setTranscriptionSettings((prev) => ({
-										...prev,
-										translateTargetLanguage: e.target.value as "english",
-									}))
-								}
-							>
-								{_TRANSLATE_TARGET_LANGUAGES.map((lang) => (
-									<option key={lang} value={lang}>
-										{lang.charAt(0).toUpperCase() + lang.slice(1)}
-									</option>
-								))}
-							</select>
-							<p className="mt-1 text-xs text-muted-foreground">
-								Translate audio to English (Whisper limitation)
-							</p>
-						</div>
-					)}
-
-					<div className="mb-3">
-						<span className="mb-1 block text-sm font-medium">AI Model</span>
-						<select
-							value={transcriptionSettings.whisperModel}
-							onChange={(e) => handleModelChange(e.target.value as WhisperModel)}
-							className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-white transition-colors hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500"
-						>
-							{Object.entries(WHISPER_MODELS).map(([key, label]) => (
-								<option key={key} value={key}>
-									{label}
-								</option>
-							))}
-						</select>
-						<p className="mt-1 text-xs text-muted-foreground">
-							Auto picks the best model for your device. Base is recommended for stability.
-						</p>
-					</div>
-
-					<label className="mb-1 flex cursor-pointer items-center gap-2">
-						<input
-							type="checkbox"
-							checked={transcriptionSettings.includeMicrophone ?? false}
-							disabled={isRecording || isModelBusy}
-							onChange={(e) =>
-								setTranscriptionSettings((prev) => ({ ...prev, includeMicrophone: e.target.checked }))
-							}
-							className="rounded"
-						/>
-						<span className="text-sm">Include microphone</span>
-					</label>
-					<p className="mb-3 text-xs text-muted-foreground">
-						Mix your voice with tab audio for transcription
-					</p>
-
-					<label className="mb-1 flex cursor-pointer items-center gap-2">
-						<input
-							type="checkbox"
-							checked={transcriptionSettings.speakerDetection ?? false}
-							disabled={isRecording || isModelBusy}
-							onChange={(e) =>
-								setTranscriptionSettings((prev) => ({ ...prev, speakerDetection: e.target.checked }))
-							}
-							className="rounded"
-						/>
-						<span className="text-sm">Speaker detection (Beta)</span>
-					</label>
-					<p className="mb-3 text-xs text-muted-foreground">
-						After Stop, detects speech turns (pauses) and labels 2 speakers. Speaker 1 is usually
-						the person who talks the most. Best for interview-style dialogue with two distinct
-						voices. Enable before Start.
-					</p>
-
-					<p className="mb-3 text-xs text-muted-foreground">
-						For reliable capture: close the side panel, open YouTube, and click the extension icon on the
-						tab with video.
-					</p>
-
-					{aiCapabilities.available === "no" && (
-						<div className="mb-3 text-center text-sm">
-							<p className="font-medium">AI Summarization is not available</p>
-							<p className="text-xs text-muted-foreground">Please make sure your Chrome supports Prompt API.</p>
-						</div>
-					)}
-					{aiCapabilities.available !== "no" && (
-						<AiSummarizer
-							setLanguage={(language: TranscriptionLanguage) =>
-								setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
-							}
-							language={transcriptionSettings.summarizationLanguage}
-							isSummaryLoading={isSummaryLoading}
-							handleSummarize={handleSummarize}
-							summary={summary}
-						/>
-					)}
-				</div>
-			)}
-
 			{modelStatus === "diarizing" && (
-				<div className="mx-2 mb-1 shrink-0 rounded border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
+				<div className="mx-2 mt-2 shrink-0 rounded border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
 					Processing speakers… This may take a minute after Stop.
 				</div>
 			)}
 
-			<footer className="shrink-0 space-y-2 border-t border-border p-2">
+			<div className="flex min-h-0 flex-1 flex-col">
+				{activePanel === "transcript" && renderTranscriptionPanel()}
+				{activePanel === "ai" && renderAiPanel(true)}
+				{activePanel === "more" && (
+					<div className="flex min-h-0 flex-1 flex-col">
+						<div className="max-h-[42%] min-h-0 shrink-0 overflow-y-auto border-b border-border px-2 py-2">
+							{renderMoreSettings()}
+						</div>
+						<div className="flex min-h-0 flex-1 flex-col">
+							<div className="grid shrink-0 grid-cols-2 gap-1 border-b border-border px-2 py-1">
+								<Button
+									type="button"
+									size="sm"
+									variant={secondaryView === "transcript" ? "secondary" : "ghost"}
+									onClick={() => setSecondaryView("transcript")}
+								>
+									Transcript
+								</Button>
+								<Button
+									type="button"
+									size="sm"
+									variant={secondaryView === "ai" ? "secondary" : "ghost"}
+									onClick={() => setSecondaryView("ai")}
+								>
+									Summary
+								</Button>
+							</div>
+							<div className="flex min-h-0 flex-1 flex-col">
+								{secondaryView === "transcript"
+									? renderTranscriptionPanel(true)
+									: renderAiPanel(true)}
+							</div>
+						</div>
+					</div>
+				)}
+			</div>
+
+			<footer className="relative shrink-0 border-t border-border p-2 pb-0 pr-0">
+				<div className="space-y-2 pb-2 pr-2">
 				<div className="flex gap-2">
 					<Button
 						className="flex-1"
@@ -482,6 +627,8 @@ const SidePanelApp: React.FC = () => {
 				>
 					Copy to Clipboard
 				</Button>
+				</div>
+				<DebugPanel />
 			</footer>
 		</div>
 	);

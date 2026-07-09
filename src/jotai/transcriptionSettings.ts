@@ -156,6 +156,7 @@ export type TranscriptionTask = "transcribe" | "translate";
 export type TranscriptionMode = "transcribe" | "translate";
 export const TRANSLATE_TARGET_LANGUAGES = ["english"] as const;
 export type TranslateTargetLanguage = (typeof TRANSLATE_TARGET_LANGUAGES)[number];
+export type SummarizationSource = "transcription" | "webpage";
 
 export type TranscriptionSettings = {
 	mode: TranscriptionMode;
@@ -165,12 +166,13 @@ export type TranscriptionSettings = {
 	autoscroll: boolean;
 	speakerDetection: boolean;
 	summarizationLanguage: TranscriptionLanguage;
+	summarizationSource: SummarizationSource;
 	whisperModel: WhisperModel;
 };
 
 export const TRANSCRIPTION_SETTINGS_KEY = "transcriptionSettings";
 
-const SETTINGS_STORAGE_VERSION = 5;
+const SETTINGS_STORAGE_VERSION = 6;
 
 export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
 	mode: "transcribe",
@@ -180,6 +182,7 @@ export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
 	autoscroll: true,
 	speakerDetection: false,
 	summarizationLanguage: "english" as TranscriptionLanguage,
+	summarizationSource: "transcription",
 	whisperModel: "auto",
 };
 
@@ -202,9 +205,13 @@ function resolveTranscribeLanguage(
 	return null;
 }
 
+function resolveSummarizationSource(stored: Record<string, unknown>): SummarizationSource {
+	return stored.summarizationSource === "webpage" ? "webpage" : "transcription";
+}
+
 function resolveStoredSettings(stored: Record<string, unknown>): Pick<
 	TranscriptionSettings,
-	"speakerDetection" | "mode" | "transcribeLanguage"
+	"speakerDetection" | "mode" | "transcribeLanguage" | "summarizationSource"
 > {
 	const storageVersion =
 		typeof stored.settingsVersion === "number" ? stored.settingsVersion : 1;
@@ -214,6 +221,7 @@ function resolveStoredSettings(stored: Record<string, unknown>): Pick<
 			speakerDetection: false,
 			mode: "transcribe",
 			transcribeLanguage: resolveTranscribeLanguage(stored, storageVersion),
+			summarizationSource: "transcription",
 		};
 	}
 
@@ -221,6 +229,7 @@ function resolveStoredSettings(stored: Record<string, unknown>): Pick<
 		speakerDetection: stored.speakerDetection === true,
 		mode: stored.mode === "translate" ? "translate" : "transcribe",
 		transcribeLanguage: resolveTranscribeLanguage(stored, storageVersion),
+		summarizationSource: resolveSummarizationSource(stored),
 	};
 }
 
@@ -248,6 +257,7 @@ export function migrateTranscriptionSettings(stored: unknown): TranscriptionSett
 		mode: resolved.mode,
 		speakerDetection: resolved.speakerDetection,
 		transcribeLanguage: resolved.transcribeLanguage,
+		summarizationSource: resolved.summarizationSource,
 	} as TranscriptionSettings;
 }
 

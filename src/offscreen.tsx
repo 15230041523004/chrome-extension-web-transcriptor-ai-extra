@@ -22,6 +22,7 @@ import { buildSpeakerSegmentsFromAudio, detectSpeechTurns } from "./lib/speechTu
 import { extractNewAudioSegment, MIN_FLUSH_AUDIO_SAMPLES } from "./lib/incrementalAudio";
 import { mergeDiarizationWithTranscript } from "./lib/mergeDiarization";
 import { normalizeModelProgress } from "./lib/modelProgress";
+import { safeRuntimeSendMessage } from "./lib/runtimeMessaging";
 import {
 	initializeWhisperWorker,
 	processWhisperMessage,
@@ -124,7 +125,7 @@ export const Offscreen: React.FC = () => {
 		modelId?: string;
 	}) => {
 		const modelId = data.modelId ?? loadedModelIdRef.current ?? undefined;
-		chrome.runtime.sendMessage({
+		safeRuntimeSendMessage({
 			type: "model-status",
 			data: modelId ? { ...data, modelId } : data,
 		});
@@ -193,12 +194,12 @@ export const Offscreen: React.FC = () => {
 		const fallbackText = transcript.text?.trim() ?? phraseChunks.map((chunk) => chunk.text).join(" ").trim();
 
 		if (formatted.trim()) {
-			chrome.runtime.sendMessage({
+			safeRuntimeSendMessage({
 				type: "transcript-diarized",
 				data: { transcripted: formatted },
 			});
 		} else if (fallbackText) {
-			chrome.runtime.sendMessage({
+			safeRuntimeSendMessage({
 				type: "transcript-diarized",
 				data: { transcripted: `Speaker 1: ${fallbackText}` },
 			});
@@ -260,7 +261,7 @@ export const Offscreen: React.FC = () => {
 
 				const text = transcripted?.join("\n").trim();
 				if (text) {
-					chrome.runtime.sendMessage({
+					safeRuntimeSendMessage({
 						type: "transcript",
 						data: { transcripted: text },
 					});
@@ -282,7 +283,7 @@ export const Offscreen: React.FC = () => {
 		finalizeBusyRef.current = true;
 
 		setRecording(false);
-		chrome.runtime.sendMessage({ type: "recording-state", data: { recording: false } });
+		safeRuntimeSendMessage({ type: "recording-state", data: { recording: false } });
 
 		const audioContext = audioContextRef.current;
 		const mimeType = recorderRef.current?.mimeType ?? mimeTypeRef.current;
@@ -384,7 +385,7 @@ export const Offscreen: React.FC = () => {
 				transcribedSamplesRef.current = 0;
 				transcribePendingRef.current = false;
 				transcribeFlushRef.current = false;
-				chrome.runtime.sendMessage({ type: "recording-state", data: { recording: true } });
+				safeRuntimeSendMessage({ type: "recording-state", data: { recording: true } });
 			};
 
 			recorderRef.current.ondataavailable = (e) => {

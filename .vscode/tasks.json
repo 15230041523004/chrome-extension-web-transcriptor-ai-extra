@@ -70,6 +70,21 @@
       "problemMatcher": []
     },
     {
+      "label": "stop chrome debug",
+      "type": "shell",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/stop-chrome-extension.mjs"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "start chrome with extension (youtube)",
       "dependsOn": ["build extension"],
       "dependsOrder": "sequence",

@@ -4,9 +4,366 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Transcriptior</title>
+    <script>
+      (function () {
+        var STORAGE_KEY = "transcriptorDebugLog";
+        var MAX_ENTRIES = 500;
+        var bootTs = new Date().toISOString();
+
+        function pushInlineLog(level, scope, message, detail) {
+          var entry = {
+            ts: new Date().toISOString(),
+            level: level,
+            scope: scope,
+            message: message,
+            context: "inline",
+            detail: detail ? JSON.stringify(detail) : undefined,
+          };
+          console.log("[inline-debug]", entry);
+          try {
+            if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+              chrome.storage.local.get(STORAGE_KEY, function (result) {
+                var log = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : [];
+                log.push(entry);
+                chrome.storage.local.set({ transcriptorDebugLog: log.slice(-MAX_ENTRIES) });
+              });
+            }
+          } catch (error) {
+            console.error("[inline-debug] persist failed", error);
+          }
+          updateInlineDebugView(entry);
+        }
+
+        function updateInlineDebugView(lastEntry) {
+          var status = document.getElementById("inline-debug-status");
+          var logEl = document.getElementById("inline-debug-log");
+          if (status && lastEntry) {
+            status.textContent =
+              "[" + lastEntry.level + "] [" + lastEntry.scope + "] " + lastEntry.message;
+          }
+          if (logEl && typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+            chrome.storage.local.get(STORAGE_KEY, function (result) {
+              var log = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : [];
+              var lines = log.slice(-12).map(function (e) {
+                return (
+                  "[" +
+                  e.level +
+                  "] [" +
+                  (e.context || "inline") +
+                  "/" +
+                  e.scope +
+                  "] " +
+                  e.message
+                );
+              });
+              logEl.textContent = lines.join("\n") || "(no log lines yet)";
+            });
+          }
+        }
+
+        function buildInlineReport(storedLog, backgroundLog, backgroundState, backgroundError) {
+          var root = document.getElementById("root");
+          var lines = [
+            "=== AI Transcriptior FULL Debug Report (inline copy) ===",
+            "build: debug-v2-max",
+            "url: " + location.href,
+            "userAgent: " + navigator.userAgent,
+            "bootTs: " + bootTs,
+            "readyState: " + document.readyState,
+            "panelBooted: " + Boolean(window.__TRANSCRIPTOR_PANEL_BOOTED__),
+            "rootChildCount: " + (root ? root.childElementCount : -1),
+            "bootFallbackVisible: " + Boolean(document.getElementById("boot-fallback")),
+            "",
+          ];
+          if (backgroundState) {
+            lines.push("--- background state ---", JSON.stringify(backgroundState, null, 2), "");
+          }
+          if (backgroundError) {
+            lines.push("--- background fetch error ---", backgroundError, "");
+          }
+          lines.push("--- storage log ---");
+          if (Array.isArray(storedLog) && storedLog.length) {
+            for (var i = 0; i < storedLog.length; i++) {
+              var e = storedLog[i];
+              lines.push(
+                "[" +
+                  e.ts +
+                  "] [" +
+                  e.level +
+                  "] [" +
+                  (e.context || "inline") +
+                  "/" +
+                  e.scope +
+                  "] " +
+                  e.message
+              );
+              if (e.detail) lines.push(e.detail);
+            }
+          } else {
+            lines.push("(empty)");
+          }
+          if (backgroundLog) {
+            lines.push("", "--- background worker log ---", backgroundLog);
+          }
+          return lines.join("\n");
+        }
+
+        function copyInlineDebugLog() {
+          var btn = document.getElementById("inline-copy-log");
+          if (btn) btn.textContent = "Copying…";
+          var storedLog = [];
+          var done = function (backgroundLog, backgroundState, backgroundError) {
+            var text = buildInlineReport(storedLog, backgroundLog, backgroundState, backgroundError);
+            function finishCopied() {
+              if (btn) {
+                btn.textContent = "Copied!";
+                setTimeout(function () {
+                  btn.textContent = "Copy FULL log";
+                }, 1500);
+              }
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(finishCopied).catch(function () {
+                console.log(text);
+                finishCopied();
+              });
+            } else {
+              console.log(text);
+              finishCopied();
+            }
+          };
+
+          if (typeof chrome === "undefined" || !chrome.storage || !chrome.storage.local) {
+            done(null, null, "chrome.storage unavailable");
+            return;
+          }
+
+          chrome.storage.local.get(STORAGE_KEY, function (result) {
+            storedLog = Array.isArray(result[STORAGE_KEY]) ? result[STORAGE_KEY] : [];
+            if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+              chrome.runtime.sendMessage({ type: "get-debug-log" }, function (response) {
+                var err = chrome.runtime.lastError ? chrome.runtime.lastError.message : null;
+                done(response && response.log, response && response.state, err);
+              });
+            } else {
+              done(null, null, "chrome.runtime unavailable");
+            }
+          });
+        }
+
+        pushInlineLog("info", "inline", "sidepanel.html inline script executed", {
+          href: location.href,
+          readyState: document.readyState,
+        });
+
+        window.addEventListener("error", function (event) {
+          pushInlineLog("error", "inline", "window.error", {
+            message: event.message,
+            filename: event.filename,
+            lineno: event.lineno,
+            colno: event.colno,
+          });
+        });
+
+        window.addEventListener("unhandledrejection", function (event) {
+          pushInlineLog("error", "inline", "unhandledrejection", {
+            reason: String(event.reason),
+          });
+        });
+
+        function setInlineDebugOpen(open) {
+          var panel = document.getElementById("inline-debug");
+          var toggle = document.getElementById("inline-debug-toggle");
+          if (panel) panel.hidden = !open;
+          if (toggle) toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        }
+
+        window.addEventListener("transcriptor-panel-booted", function () {
+          pushInlineLog("info", "inline", "React panel booted — hiding inline debug UI");
+          var panel = document.getElementById("inline-debug");
+          var toggle = document.getElementById("inline-debug-toggle");
+          if (panel) panel.hidden = true;
+          if (toggle) toggle.style.display = "none";
+        });
+
+        document.addEventListener("DOMContentLoaded", function () {
+          var copyBtn = document.getElementById("inline-copy-log");
+          var toggleBtn = document.getElementById("inline-debug-toggle");
+          if (copyBtn) copyBtn.addEventListener("click", copyInlineDebugLog);
+          if (toggleBtn) {
+            toggleBtn.addEventListener("click", function () {
+              var panel = document.getElementById("inline-debug");
+              setInlineDebugOpen(Boolean(panel && panel.hidden));
+            });
+          }
+          setInlineDebugOpen(false);
+          updateInlineDebugView(null);
+
+          setTimeout(function () {
+            if (!window.__TRANSCRIPTOR_PANEL_BOOTED__) {
+              pushInlineLog("warn", "inline", "Panel module not booted after 3s", {
+                bootFallbackVisible: Boolean(document.getElementById("boot-fallback")),
+                rootChildCount: document.getElementById("root")
+                  ? document.getElementById("root").childElementCount
+                  : -1,
+              });
+            }
+          }, 3000);
+
+          setTimeout(function () {
+            if (!window.__TRANSCRIPTOR_PANEL_BOOTED__) {
+              pushInlineLog("error", "inline", "Panel module STILL not booted after 10s — likely JS load/render failure");
+            }
+          }, 10000);
+        });
+
+        window.__TRANSCRIPTOR_INLINE_DEBUG__ = {
+          pushInlineLog: pushInlineLog,
+          copyInlineDebugLog: copyInlineDebugLog,
+        };
+      })();
+    </script>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        min-height: 100vh;
+        margin: 0;
+      }
+      #root {
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+      #inline-debug-toggle {
+        position: fixed;
+        right: 0;
+        bottom: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      #inline-debug {
+        position: fixed;
+        right: 4px;
+        bottom: 36px;
+        z-index: 2147483646;
+        box-sizing: border-box;
+        width: min(calc(100vw - 24px), 352px);
+        padding: 10px 12px;
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 10px;
+        line-height: 1.4;
+        color: #3f3f46;
+        background: #ffffff;
+        border: 1px solid #e4e4e7;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+      }
+      #inline-debug-status {
+        margin-bottom: 6px;
+        font-family: system-ui, sans-serif;
+        font-size: 11px;
+        font-weight: 600;
+        color: #18181b;
+      }
+      #inline-debug-log {
+        margin: 0 0 8px;
+        max-height: 160px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #52525b;
+        background: #f4f4f5;
+        border-radius: 6px;
+        padding: 8px;
+      }
+      #inline-copy-log {
+        cursor: pointer;
+        border: 1px solid #d4d4d8;
+        background: #f4f4f5;
+        color: #18181b;
+        border-radius: 6px;
+        padding: 6px 10px;
+        font-family: system-ui, sans-serif;
+        font-size: 11px;
+      }
+      #inline-copy-log:hover {
+        background: #e4e4e7;
+      }
+      @media (prefers-color-scheme: dark) {
+        #inline-debug {
+          color: #d4d4d8;
+          background: #18181b;
+          border-color: #3f3f46;
+        }
+        #inline-debug-status {
+          color: #fafafa;
+        }
+        #inline-debug-log {
+          color: #a1a1aa;
+          background: #27272a;
+        }
+        #inline-copy-log {
+          border-color: #52525b;
+          background: #27272a;
+          color: #fafafa;
+        }
+        #inline-copy-log:hover {
+          background: #3f3f46;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div
+        id="boot-fallback"
+        style="
+          box-sizing: border-box;
+          min-height: 100vh;
+          padding: 16px;
+          font-family: system-ui, sans-serif;
+          font-size: 14px;
+          color: #e5e5e5;
+          background: #0a0a0a;
+        "
+      >
+        <p style="margin: 0 0 8px; font-weight: 600">Loading panel…</p>
+        <p style="margin: 0; font-size: 12px; color: #a3a3a3">
+          If this stays empty, click the <strong>bug icon</strong> in the corner and copy the full log.
+        </p>
+      </div>
+    </div>
+
+    <button
+      type="button"
+      id="inline-debug-toggle"
+      aria-label="Open debug log"
+      aria-expanded="false"
+      aria-controls="inline-debug"
+    >
+      🐛
+    </button>
+
+    <div id="inline-debug" hidden>
+      <div id="inline-debug-status">Debug: waiting for panel module…</div>
+      <pre id="inline-debug-log">(loading log…)</pre>
+      <button type="button" id="inline-copy-log">Copy FULL log</button>
+    </div>
+
     <script type="module" src="/src/side-panel.tsx"></script>
   </body>
 </html>

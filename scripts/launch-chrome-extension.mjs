@@ -1,16 +1,24 @@
 import * as ChromeLauncher from "chrome-launcher";
-import { spawn, execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	DEBUG_PORT,
+	ensureExtensionReady,
+	killDebugChrome,
+	pidFile,
+	profilePath,
+	sleep,
+	toChromeFlagPath,
+	waitForDebugPort,
+} from "./chrome-debug-utils.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
 const distPath = realpathSync.native(resolve(root, "dist"));
-const profilePath = resolve(root, ".vscode/chrome-debug-profile");
-const pidFile = join(profilePath, ".debug-chrome.pid");
-const DEBUG_PORT = 9222;
-const PROFILE_MARKER = "chrome-debug-profile";
+const PROFILE_SYNC_DELAY_MS = 1500;
 
 function findChrome() {
 	if (process.env.CHROME_PATH && existsSync(process.env.CHROME_PATH)) {
@@ -19,90 +27,6 @@ function findChrome() {
 
 	const installations = ChromeLauncher.Launcher.getInstallations();
 	return installations[0];
-}
-
-function killProcessTree(pid) {
-	if (!pid) {
-		return;
-	}
-
-	try {
-		if (process.platform === "win32") {
-			execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
-		} else {
-			process.kill(Number(pid), "SIGTERM");
-		}
-	} catch {
-		// Process already exited.
-	}
-}
-
-function killChromeUsingDebugProfile() {
-	if (process.platform === "win32") {
-		try {
-			execSync(
-				`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='chrome.exe'\\" | Where-Object { $_.CommandLine -like '*${PROFILE_MARKER}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`,
-				{ stdio: "ignore" },
-			);
-		} catch {
-			// Ignore cleanup errors.
-		}
-		return;
-	}
-
-	try {
-		const output = execSync("ps ax -o pid=,command=", { encoding: "utf8" });
-		for (const line of output.split("\n")) {
-			if (line.includes(PROFILE_MARKER)) {
-				const pid = line.trim().split(/\s+/)[0];
-				killProcessTree(pid);
-			}
-		}
-	} catch {
-		// Ignore cleanup errors.
-	}
-}
-
-function killPreviousChrome() {
-	if (existsSync(pidFile)) {
-		killProcessTree(readFileSync(pidFile, "utf8").trim());
-		try {
-			rmSync(pidFile);
-		} catch {
-			// Ignore cleanup errors.
-		}
-	}
-
-	killChromeUsingDebugProfile();
-}
-
-function waitForDebugPort(port, attempts = 80, delayMs = 250) {
-	return new Promise((resolvePromise, rejectPromise) => {
-		let tries = 0;
-
-		const check = () => {
-			fetch(`http://127.0.0.1:${port}/json/version`)
-				.then((response) => {
-					if (response.ok) {
-						resolvePromise();
-						return;
-					}
-					retry();
-				})
-				.catch(retry);
-		};
-
-		const retry = () => {
-			tries += 1;
-			if (tries >= attempts) {
-				rejectPromise(new Error(`Chrome debug port ${port} did not become ready.`));
-				return;
-			}
-			setTimeout(check, delayMs);
-		};
-
-		setTimeout(check, delayMs);
-	});
 }
 
 async function loadExtensionViaPipe(chromeInstance, extensionPath) {
@@ -115,7 +39,7 @@ async function loadExtensionViaPipe(chromeInstance, extensionPath) {
 	const request = {
 		id: requestId,
 		method: "Extensions.loadUnpacked",
-		params: { path: extensionPath },
+		params: { path: toChromeFlagPath(extensionPath) },
 	};
 
 	const response = await new Promise((resolvePromise, rejectPromise) => {
@@ -178,11 +102,11 @@ async function loadExtensionViaPipe(chromeInstance, extensionPath) {
 	return response.result;
 }
 
-async function installExtension(extensionPath, profilePath) {
+async function installExtensionIntoProfile(extensionPath, profilePath) {
 	const chromeFlags = ChromeLauncher.Launcher.defaultFlags()
 		.filter((flag) => flag !== "--disable-extensions")
 		.concat([
-			`--user-data-dir=${profilePath}`,
+			`--user-data-dir=${toChromeFlagPath(profilePath)}`,
 			"--remote-debugging-pipe",
 			"--enable-unsafe-extension-debugging",
 			"--no-first-run",
@@ -212,9 +136,10 @@ async function launchDebugChrome(url, profilePath) {
 	}
 
 	const args = [
-		`--user-data-dir=${profilePath}`,
+		`--user-data-dir=${toChromeFlagPath(profilePath)}`,
 		`--remote-debugging-port=${DEBUG_PORT}`,
 		"--remote-allow-origins=*",
+		"--enable-unsafe-extension-debugging",
 		"--no-first-run",
 		"--no-default-browser-check",
 		url,
@@ -241,13 +166,16 @@ async function main() {
 	const url = process.argv[2] || "about:blank";
 
 	mkdirSync(profilePath, { recursive: true });
-	killPreviousChrome();
+	killDebugChrome();
 
 	console.log("Installing extension into the debug Chrome profile...");
 	console.log(`  Extension: ${distPath}`);
 
-	const loadResult = await installExtension(distPath, profilePath);
-	console.log(`Extension installed/updated: AI Transcriptior (id: ${loadResult.id}).`);
+	const loadResult = await installExtensionIntoProfile(distPath, profilePath);
+	console.log(`Extension registered in profile (id: ${loadResult.id}).`);
+
+	console.log(`Waiting ${PROFILE_SYNC_DELAY_MS}ms for profile sync...`);
+	await sleep(PROFILE_SYNC_DELAY_MS);
 
 	console.log("Launching Chrome for debugging...");
 	const child = await launchDebugChrome(url, profilePath);
@@ -257,11 +185,17 @@ async function main() {
 	}
 
 	child.unref();
+
+	console.log("Waiting for Chrome debug port...");
 	await waitForDebugPort(DEBUG_PORT);
+	await sleep(1000);
+
+	await ensureExtensionReady(DEBUG_PORT, distPath);
 
 	console.log(`Chrome started (PID ${child.pid ?? "unknown"}).`);
 	console.log(`Debugger port: ${DEBUG_PORT}`);
-	console.log("Open chrome://extensions to verify the extension is listed.");
+	console.log("Open chrome://extensions — AI Transcriptior should be listed and enabled.");
+	console.log("To stop debug Chrome later, run: npm run stop:chrome");
 }
 
 main().catch((error) => {

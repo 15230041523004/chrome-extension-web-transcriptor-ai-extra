@@ -7,6 +7,7 @@ import {
 	TextStreamer,
 	WhisperForConditionalGeneration,
 } from "@huggingface/transformers";
+import { safeRuntimeSendMessage } from "./lib/runtimeMessaging";
 
 const WHISPER_SAMPLE_RATE = 16_000;
 
@@ -395,7 +396,7 @@ export async function processWhisperMessage(
 		}
 
 		liveProcessing = false;
-		chrome.runtime.sendMessage({
+		safeRuntimeSendMessage({
 			type: "model-status",
 			data: { status: "error", message: String(err?.message ?? err) },
 		});
@@ -479,7 +480,7 @@ export async function processWhisperWithTimestamps(
 		}
 
 		batchProcessing = false;
-		chrome.runtime.sendMessage({
+		safeRuntimeSendMessage({
 			type: "model-status",
 			data: { status: "error", message: String(err?.message ?? err) },
 		});
@@ -504,7 +505,7 @@ export async function initializeWhisperWorker(progress_callback, modelId = null)
 		}
 
 		AutomaticSpeechRecognitionPipeline.reset();
-		chrome.runtime.sendMessage({
+		safeRuntimeSendMessage({
 			type: "model-status",
 			data: { status: "error", message: String(err?.message ?? err) },
 		});

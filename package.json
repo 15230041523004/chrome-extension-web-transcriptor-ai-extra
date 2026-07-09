@@ -10,7 +10,8 @@
     "build:watch": "concurrently \"tsc -b --watch\" \"vite build --watch\"",
     "check": "biome check . --config-path=./biome.json",
     "preview": "vite preview",
-    "launch:chrome": "node scripts/launch-chrome-extension.mjs"
+    "launch:chrome": "node scripts/launch-chrome-extension.mjs",
+    "stop:chrome": "node scripts/stop-chrome-extension.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",

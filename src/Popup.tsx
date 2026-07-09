@@ -1,59 +1,63 @@
 import type React from "react";
 import { useEffect, useState } from "react";
+import { useAtom } from "jotai";
 import { AiSummarizer } from "./components/ai-summarizer";
 import { Textarea } from "./components/ui/textarea";
 import { useToast } from "./components/ui/use-toast";
-import { summarizeWebPage } from "./summarizer";
-
-const getDefaultLanguage = () => {
-	const browserLocale = navigator.language;
-	if (browserLocale.startsWith("ja")) {
-		return "japanese";
-	}
-	return "english";
-};
-
-const fetchAiCapabilities = async () => {
-	if (!window.ai) {
-		return {
-			available: "no",
-		};
-	}
-
-	const { available } = await window.ai.languageModel.capabilities();
-
-	return {
-		available,
-	};
-};
+import { transcriptionSettingsAtom, type TranscriptionLanguage } from "./jotai/settingAtom";
+import { getAiSummarizationStatus } from "./lib/chromeAi";
+import { summarizeTranscription, summarizeWebPage } from "./summarizer";
 
 const Popup: React.FC = () => {
 	const [summary, setSummary] = useState("");
-	const [language, setLanguage] = useState(getDefaultLanguage());
+	const [transcriptionSettings, setTranscriptionSettings] = useAtom(transcriptionSettingsAtom);
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
-	const [aiCapabilities, setAiCapabilities] = useState<{ available: string }>({
-		available: "no",
+	const [aiStatus, setAiStatus] = useState({
+		available: false,
+		downloading: false,
 	});
 	const [transcription, setTranscription] = useState("");
 
 	useEffect(() => {
-		fetchAiCapabilities().then((capabilities) => {
-			setAiCapabilities(capabilities);
+		getAiSummarizationStatus().then((status) => {
+			setAiStatus({
+				available: status.available,
+				downloading: status.downloading,
+			});
 		});
 
-		chrome.runtime.onMessage.addListener((message) => {
+		const messageListener = (message: { type?: string; data?: { transcripted?: string } }) => {
 			if (message.type === "transcript") {
-				setTranscription((prev) => `${prev}\n${message.data}`);
+				const next = (message.data?.transcripted ?? "").trim();
+				if (!next) return;
+				setTranscription((prev) => (prev ? `${prev}\n${next}` : next));
+			} else if (message.type === "transcript-diarized") {
+				const next = (message.data?.transcripted ?? "").trim();
+				if (!next) return;
+				setTranscription(next);
 			}
-		});
+		};
+
+		chrome.runtime.onMessage.addListener(messageListener);
+		return () => chrome.runtime.onMessage.removeListener(messageListener);
 	}, []);
 
 	const { toast } = useToast();
 
+	const canSummarize =
+		transcriptionSettings.summarizationSource === "webpage" ||
+		transcription.trim().length > 0;
+
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
-			const result = await summarizeWebPage(language);
+			const result =
+				transcriptionSettings.summarizationSource === "transcription"
+					? await summarizeTranscription(
+							transcription,
+							transcriptionSettings.summarizationLanguage,
+						)
+					: await summarizeWebPage(transcriptionSettings.summarizationLanguage);
 			setSummary(result);
 			toast({
 				description: "Summarized",
@@ -74,7 +78,6 @@ const Popup: React.FC = () => {
 	return (
 		<div className="container">
 			<div className="box-border h-auto w-[400px]">
-				{/* Transcription from web speech api */}
 				<div className="flex flex-col m-1 p-1">
 					<div className="text-center">
 						<h1>Transcription</h1>
@@ -82,25 +85,38 @@ const Popup: React.FC = () => {
 					</div>
 				</div>
 
-				{aiCapabilities.available === "no" && (
+				{!aiStatus.available ? (
 					<div className="flex flex-col m-1 p-1">
 						<div className="text-center">
 							<h1>AI Summarization is not available</h1>
 							<p>
-								AI Summarization is not available. Please make sure your chrome
-								supports Prompt API.
+								Use Chrome or Brave 138+ with on-device AI (Gemini Nano) enabled in browser
+								settings.
 							</p>
 						</div>
 					</div>
-				)}
-				{aiCapabilities.available !== "no" && (
-					<AiSummarizer
-						setLanguage={setLanguage}
-						language={language}
-						isSummaryLoading={isSummaryLoading}
-						handleSummarize={handleSummarize}
-						summary={summary}
-					/>
+				) : (
+					<div className="m-1 p-1">
+						{aiStatus.downloading && (
+							<p className="mb-2 text-xs text-muted-foreground">
+								On-device AI model is downloading. The first summary may take longer.
+							</p>
+						)}
+						<AiSummarizer
+							language={transcriptionSettings.summarizationLanguage}
+							setLanguage={(language: TranscriptionLanguage) =>
+								setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
+							}
+							source={transcriptionSettings.summarizationSource}
+							setSource={(source) =>
+								setTranscriptionSettings((prev) => ({ ...prev, summarizationSource: source }))
+							}
+							isSummaryLoading={isSummaryLoading}
+							handleSummarize={handleSummarize}
+							summary={summary}
+							canSummarize={canSummarize}
+						/>
+					</div>
 				)}
 			</div>
 		</div>
