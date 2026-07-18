@@ -103,17 +103,33 @@ async function sendCdpCommandViaPipe(chromeInstance, method, params = {}) {
 	return response.result;
 }
 
-async function launchDebugChrome(url, profilePath) {
+/**
+ * chrome-launcher defaultFlags() are Lighthouse-oriented automation flags.
+ * Several of them break real media playback / YouTube while debugging an extension:
+ * - --mute-audio → no sound at all (and tabCapture gets silence)
+ * - --disable-component-update → Widevine / media components never update
+ * - --disable-extensions → filtered so we can load our unpacked extension
+ */
+const AUTOMATION_FLAGS_TO_DROP = new Set([
+	"--disable-extensions",
+	"--mute-audio",
+	"--disable-component-update",
+	"--disable-component-extensions-with-background-pages",
+]);
+
+async function launchDebugChrome(url, profileDir) {
 	const chromeFlags = ChromeLauncher.Launcher.defaultFlags()
-		.filter((flag) => flag !== "--disable-extensions")
+		.filter((flag) => !AUTOMATION_FLAGS_TO_DROP.has(flag))
 		.concat([
-			`--user-data-dir=${toChromeFlagPath(profilePath)}`,
+			`--user-data-dir=${toChromeFlagPath(profileDir)}`,
 			"--remote-debugging-pipe",
 			`--remote-debugging-port=${DEBUG_PORT}`,
 			"--remote-allow-origins=*",
 			"--enable-unsafe-extension-debugging",
 			"--no-first-run",
 			"--no-default-browser-check",
+			// Allow media autoplay without a prior click (handy for extension testing).
+			"--autoplay-policy=no-user-gesture-required",
 		]);
 
 	const chromeInstance = await ChromeLauncher.launch({
