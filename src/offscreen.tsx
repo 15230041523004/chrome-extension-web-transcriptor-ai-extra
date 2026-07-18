@@ -1,10 +1,10 @@
-// MUST be first: configure ONNX Runtime to use local WASM
-import "./ort-env-bootstrap";
-
+// IMPORTANT: Do NOT import whisper/onnx/transformers at the top level.
+// chrome.offscreen.createDocument waits for the document load event, and a top-level
+// import of the ML stack (~20MB+ WASM) blocks first launch for tens of seconds.
+// Capture must start immediately; load models lazily after recording begins.
 import React from "react";
 import { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import "./globals.css";
 import {
 	DEFAULT_TRANSCRIPTION_SETTINGS,
 	getLanguageDetectionPriority,
@@ -13,21 +13,25 @@ import {
 	type WhisperModel,
 } from "./jotai/transcriptionSettings";
 import { buildPhraseChunks } from "./lib/phraseChunks";
-import {
-	assignSpeakersByPause,
-	initializeSpeakerEmbeddings,
-	resetSpeakerEmbeddings,
-} from "./lib/speakerEmbeddings";
-import { buildSpeakerSegmentsFromAudio, detectSpeechTurns } from "./lib/speechTurns";
 import { extractNewAudioSegment, MIN_FLUSH_AUDIO_SAMPLES } from "./lib/incrementalAudio";
 import { mergeDiarizationWithTranscript } from "./lib/mergeDiarization";
 import { normalizeModelProgress } from "./lib/modelProgress";
 import { safeRuntimeSendMessage } from "./lib/runtimeMessaging";
-import {
-	initializeWhisperWorker,
-	processWhisperMessage,
-	processWhisperWithTimestamps,
-} from "./whisper-worker.js";
+
+type WhisperApi = typeof import("./whisper-worker.js");
+
+let whisperApiPromise: Promise<WhisperApi> | null = null;
+
+const loadWhisperApi = async (): Promise<WhisperApi> => {
+	if (!whisperApiPromise) {
+		whisperApiPromise = (async () => {
+			// Configure ORT before transformers is evaluated.
+			await import("./ort-env-bootstrap");
+			return import("./whisper-worker.js");
+		})();
+	}
+	return whisperApiPromise;
+};
 
 const WHISPER_SAMPLING_RATE = 16_000;
 const MAX_AUDIO_LENGTH = 30;
@@ -70,6 +74,7 @@ export const Offscreen: React.FC = () => {
 	const settingsRef = useRef<TranscriptionSettings>(DEFAULT_TRANSCRIPTION_SETTINGS);
 	const recorderRef = React.useRef<MediaRecorder | null>(null);
 	const [recording, setRecording] = useState(false);
+	const recordingRef = useRef(false);
 	const audioContextRef = React.useRef<AudioContext | null>(null);
 	const [chunks, setChunks] = useState<Blob[]>([]);
 	const modelLoadedRef = React.useRef(false);
@@ -102,6 +107,7 @@ export const Offscreen: React.FC = () => {
 		audioContextRef.current?.close();
 		audioContextRef.current = null;
 		mimeTypeRef.current = "";
+		recordingRef.current = false;
 		setRecording(false);
 		setChunks([]);
 		chunksRef.current = [];
@@ -118,16 +124,53 @@ export const Offscreen: React.FC = () => {
 		releaseMediaResources();
 	};
 
+	const lastModelStatusRef = useRef<{
+		status: string;
+		progress: number;
+		sentAt: number;
+	}>({ status: "", progress: -1, sentAt: 0 });
+
 	const sendModelStatus = (data: {
 		status: "loading" | "ready" | "error" | "diarizing";
 		progress?: number;
 		message?: string;
 		modelId?: string;
 	}) => {
+		const progress =
+			typeof data.progress === "number" && Number.isFinite(data.progress)
+				? Math.min(100, Math.max(0, Math.round(data.progress)))
+				: undefined;
+		const now = Date.now();
+		const last = lastModelStatusRef.current;
+		const isTerminal = data.status === "ready" || data.status === "error";
+		const progressDelta =
+			progress === undefined || last.progress < 0 ? 100 : Math.abs(progress - last.progress);
+
+		// Throttle loading/diarizing progress spam (was filling the 500-entry debug log).
+		if (
+			!isTerminal &&
+			data.status === last.status &&
+			progressDelta < 5 &&
+			now - last.sentAt < 250
+		) {
+			return;
+		}
+
+		lastModelStatusRef.current = {
+			status: data.status,
+			progress: progress ?? last.progress,
+			sentAt: now,
+		};
+
 		const modelId = data.modelId ?? loadedModelIdRef.current ?? undefined;
+		const payload = {
+			...data,
+			...(progress !== undefined ? { progress } : {}),
+			...(modelId ? { modelId } : {}),
+		};
 		safeRuntimeSendMessage({
 			type: "model-status",
-			data: modelId ? { ...data, modelId } : data,
+			data: payload,
 		});
 	};
 
@@ -136,6 +179,7 @@ export const Offscreen: React.FC = () => {
 			modelLoadedRef.current = false;
 			loadedModelIdRef.current = modelId;
 			sendModelStatus({ status: "loading", progress: 0, modelId });
+			const { initializeWhisperWorker } = await loadWhisperApi();
 			await initializeWhisperWorker((progress) => {
 				sendModelStatus({
 					status: "loading",
@@ -155,6 +199,7 @@ export const Offscreen: React.FC = () => {
 		const { language, languagePriority } = resolveTranscriptionLanguage(settings);
 
 		await ensureWhisperModel(modelId);
+		const { processWhisperWithTimestamps } = await loadWhisperApi();
 
 		const transcript = await processWhisperWithTimestamps(
 			sessionAudio,
@@ -164,6 +209,13 @@ export const Offscreen: React.FC = () => {
 			languagePriority,
 		);
 		if (!transcript) return;
+
+		const {
+			assignSpeakersByPause,
+			initializeSpeakerEmbeddings,
+			resetSpeakerEmbeddings,
+		} = await import("./lib/speakerEmbeddings");
+		const { buildSpeakerSegmentsFromAudio, detectSpeechTurns } = await import("./lib/speechTurns");
 
 		let segments: Awaited<ReturnType<typeof buildSpeakerSegmentsFromAudio>> = [];
 		try {
@@ -246,6 +298,7 @@ export const Offscreen: React.FC = () => {
 				const settings = settingsRef.current;
 				const modelId = resolveModelId(settings.whisperModel);
 				await ensureWhisperModel(modelId);
+				const { processWhisperMessage } = await loadWhisperApi();
 
 				const task = settings.mode === "translate" ? "translate" : "transcribe";
 				const { language, languagePriority } = resolveTranscriptionLanguage(settings);
@@ -282,6 +335,7 @@ export const Offscreen: React.FC = () => {
 		if (finalizeBusyRef.current) return;
 		finalizeBusyRef.current = true;
 
+		recordingRef.current = false;
 		setRecording(false);
 		safeRuntimeSendMessage({ type: "recording-state", data: { recording: false } });
 
@@ -379,6 +433,7 @@ export const Offscreen: React.FC = () => {
 			source.connect(output.destination);
 
 			recorderRef.current.onstart = () => {
+				recordingRef.current = true;
 				setRecording(true);
 				setChunks([]);
 				chunksRef.current = [];
@@ -408,6 +463,18 @@ export const Offscreen: React.FC = () => {
 			recorderRef.current.start();
 		} catch (err) {
 			console.error("Setup error:", err);
+			const message = err instanceof Error ? err.message : String(err);
+			safeRuntimeSendMessage({
+				type: "capture-error",
+				data: {
+					error: `Failed to start tab audio capture: ${message}`,
+				},
+			});
+			safeRuntimeSendMessage({
+				type: "recording-state",
+				data: { recording: false },
+			});
+			releaseMediaResources();
 		}
 	};
 
@@ -423,13 +490,29 @@ export const Offscreen: React.FC = () => {
 	}, [recording, chunks, transcribeLatestAudio]);
 
 	useEffect(() => {
-		const onMessage = (message: {
-			target?: string;
-			type?: string;
-			streamId?: string;
-			settings?: TranscriptionSettings;
-		}) => {
+		const onMessage = (
+			message: {
+				target?: string;
+				type?: string;
+				streamId?: string;
+				settings?: TranscriptionSettings;
+			},
+			_sender: chrome.runtime.MessageSender,
+			sendResponse: (response?: unknown) => void,
+		) => {
 			if (message.target !== "offscreen") return;
+
+			if (message.type === "ping-offscreen") {
+				safeRuntimeSendMessage({ type: "offscreen-ready" });
+				return;
+			}
+
+			if (message.type === "get-offscreen-state") {
+				const active =
+					recorderRef.current?.state === "recording" || recordingRef.current;
+				sendResponse({ recording: active });
+				return true;
+			}
 
 			if (message.type === "prepare-capture") {
 				requestStopRecording();
@@ -451,6 +534,8 @@ export const Offscreen: React.FC = () => {
 		};
 
 		chrome.runtime.onMessage.addListener(onMessage);
+		// Tell the service worker the listener is attached before any start-recording.
+		safeRuntimeSendMessage({ type: "offscreen-ready" });
 
 		return () => {
 			chrome.runtime.onMessage.removeListener(onMessage);
@@ -460,8 +545,6 @@ export const Offscreen: React.FC = () => {
 	return <div><h1>Offscreen Document</h1></div>;
 };
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-	<React.StrictMode>
-		<Offscreen />
-	</React.StrictMode>,
-);
+// Avoid StrictMode double-mount in the offscreen capture document (can drop the first
+// start-recording while the listener is torn down/re-attached during boot).
+ReactDOM.createRoot(document.getElementById("root")!).render(<Offscreen />);

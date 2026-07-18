@@ -30,7 +30,6 @@ type ActivePanel = "transcript" | "ai" | "more";
 type SecondaryView = "transcript" | "ai";
 
 const SidePanelApp: React.FC = () => {
-	debugLog("side-panel-app", "Component render start");
 	const [summary, setSummary] = useState("");
 	const [transcriptionSettings, setTranscriptionSettings] = useAtom(transcriptionSettingsAtom);
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
@@ -43,6 +42,7 @@ const SidePanelApp: React.FC = () => {
 	const [loadingProgress, setLoadingProgress] = useAtom(modelLoadingProgressAtom);
 	const [loadedModelId, setLoadedModelId] = useAtom(loadedModelIdAtom);
 	const [isRecording, setIsRecording] = useState(false);
+	const [isStartingCapture, setIsStartingCapture] = useState(false);
 	const [activeTabId, setActiveTabId] = useState<number | null>(null);
 	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 	const [captureError, setCaptureError] = useState<string | null>(null);
@@ -78,36 +78,6 @@ const SidePanelApp: React.FC = () => {
 		});
 	};
 
-	const requestCaptureForTab = (tabId: number, retrying = false) => {
-		debugLog("capture", "requestCaptureForTab", { tabId, retrying });
-		chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-			const captureError = chrome.runtime.lastError;
-			if (captureError || !streamId) {
-				const detail = captureError?.message ?? "unknown error";
-				if (!retrying && detail.includes("active stream")) {
-					chrome.runtime.sendMessage({ type: "release-capture" }, () => {
-						window.setTimeout(() => requestCaptureForTab(tabId, true), 600);
-					});
-					return;
-				}
-				if (detail.includes("not been invoked") || detail.includes("activeTab")) {
-					setCaptureError(
-						"Chrome only allows capture when you click the extension icon on the tab with video. Close the side panel, open YouTube, and click the icon on that tab.",
-					);
-				} else if (detail.includes("active stream")) {
-					setCaptureError(
-						"This tab is already being captured. Press Stop, wait a second, and try again.",
-					);
-				} else {
-					setCaptureError(`Capture rejected: ${detail}`);
-				}
-				return;
-			}
-
-			chrome.runtime.sendMessage({ type: "start-with-stream-id", streamId });
-		});
-	};
-
 	const handleStartTranscription = () => {
 		if (isRecording) {
 			chrome.runtime.sendMessage({ type: "stop-transcription" });
@@ -121,14 +91,34 @@ const SidePanelApp: React.FC = () => {
 
 		if (!isCapturableUrl(activeTabUrl)) {
 			setCaptureError(
-				`Cannot capture this page (${activeTabUrl ?? "unknown"}). Open YouTube and click the extension icon on the video tab.`,
+				`Cannot capture this page (${activeTabUrl ?? "unknown"}). Open a normal website tab with video/audio and try again.`,
 			);
 			return;
 		}
 
-		chrome.runtime.sendMessage({ type: "release-capture" }, () => {
-			requestCaptureForTab(activeTabId);
+		// Capture must run in the service worker. Calling tabCapture from the side panel
+		// often fails (gesture / activeTab) and left recording stuck after partial starts.
+		setCaptureError(null);
+		setIsStartingCapture(true);
+		debugLog("capture", "start-transcription via background", {
+			tabId: activeTabId,
+			tabUrl: activeTabUrl,
 		});
+		chrome.runtime.sendMessage(
+			{
+				type: "start-transcription",
+				tabId: activeTabId,
+				tabUrl: activeTabUrl,
+			},
+			() => {
+				if (chrome.runtime.lastError) {
+					setCaptureError(
+						chrome.runtime.lastError.message ||
+							"Background worker did not respond. Reload the extension from chrome://extensions.",
+					);
+				}
+			},
+		);
 	};
 
 	useEffect(() => {
@@ -157,15 +147,27 @@ const SidePanelApp: React.FC = () => {
 
 		chrome.runtime.sendMessage(
 			{ type: "get-recording-state" },
-			(response?: { recording?: boolean }) => {
+			(response?: { recording?: boolean; starting?: boolean }) => {
 				if (response?.recording !== undefined) {
 					setIsRecording(response.recording);
+				}
+				if (response?.starting !== undefined) {
+					setIsStartingCapture(response.starting);
 				}
 			},
 		);
 
 		const messageListener = (message: any) => {
-			debugLog("side-panel-app", "runtime message", message?.type ?? message);
+			// Skip noisy progress ticks in the debug log (they used to fill all 500 slots).
+			if (
+				message?.type !== "model-status" &&
+				message?.type !== "transcript" &&
+				message?.type !== "offscreen-ready" &&
+				message?.type !== "start-recording" &&
+				message?.type !== "capture-starting"
+			) {
+				debugLog("side-panel-app", "runtime message", message?.type ?? message);
+			}
 			if (message.type === "transcript") {
 				const next = (message.data?.transcripted ?? "").trim();
 				if (!next) return;
@@ -176,28 +178,36 @@ const SidePanelApp: React.FC = () => {
 				setTranscription(next);
 			} else if (message.type === "model-status") {
 				const status = message.data?.status;
-				setModelStatus(
+				const nextStatus =
 					status === "loading" ||
-						status === "ready" ||
-						status === "error" ||
-						status === "diarizing"
+					status === "ready" ||
+					status === "error" ||
+					status === "diarizing"
 						? status
-						: "unknown",
-				);
+						: "unknown";
+				setModelStatus((prev) => (prev === nextStatus ? prev : nextStatus));
 				if (status === "error") {
 					setModelError(typeof message.data?.message === "string" ? message.data.message : "Model error (see console)");
 					setTimeout(() => setModelError(null), 8000);
 				}
 				if (status === "loading" || status === "diarizing") {
-					setLoadingProgress(normalizeModelProgress(message.data?.progress));
+					const nextProgress = normalizeModelProgress(message.data?.progress);
+					setLoadingProgress((prev) => (prev === nextProgress ? prev : nextProgress));
 				}
 				if (typeof message.data?.modelId === "string") {
 					setLoadedModelId(message.data.modelId);
 				}
 			} else if (message.type === "recording-state") {
 				setIsRecording(message.data?.recording ?? false);
+				if (message.data?.recording) {
+					setIsStartingCapture(false);
+				}
+			} else if (message.type === "capture-starting") {
+				setIsStartingCapture(Boolean(message.data?.starting));
 			} else if (message.type === "capture-error") {
 				setCaptureError(typeof message.data?.error === "string" ? message.data.error : String(message.data?.error || "Unknown error"));
+				setIsRecording(false);
+				setIsStartingCapture(false);
 				setTimeout(() => setCaptureError(null), 8000);
 			}
 		};
@@ -211,13 +221,14 @@ const SidePanelApp: React.FC = () => {
 	}, [setModelStatus, setLoadingProgress, setLoadedModelId]);
 
 	useEffect(() => {
+		// Snapshot only on meaningful UI transitions (not every transcript tick).
 		debugLog("side-panel-app", "UI state snapshot", {
 			activePanel,
 			activeTabId,
 			activeTabUrl,
 			isRecording,
+			isStartingCapture,
 			modelStatus,
-			transcriptionLength: transcription.length,
 			aiAvailable: aiStatus.available,
 		});
 	}, [
@@ -225,8 +236,8 @@ const SidePanelApp: React.FC = () => {
 		activeTabId,
 		activeTabUrl,
 		isRecording,
+		isStartingCapture,
 		modelStatus,
-		transcription.length,
 		aiStatus.available,
 	]);
 
@@ -273,6 +284,7 @@ const SidePanelApp: React.FC = () => {
 	};
 
 	const isModelBusy = modelStatus === "loading" || modelStatus === "diarizing";
+	const isCaptureBusy = isRecording || isStartingCapture || isModelBusy;
 
 	const modelStatusLabel =
 		modelStatus === "diarizing" ? "Processing speakers..." : modelStatus;
@@ -499,13 +511,10 @@ const SidePanelApp: React.FC = () => {
 			</p>
 
 			<p className="text-xs text-muted-foreground">
-				For reliable capture: close the side panel, open YouTube, and click the extension icon on the
-				tab with video.
+				Start from this panel, or click the extension icon on the tab with video/audio.
 			</p>
 		</>
 	);
-
-	debugLog("side-panel-app", "Component render return");
 
 	return (
 		<div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -604,10 +613,16 @@ const SidePanelApp: React.FC = () => {
 					<Button
 						className="flex-1"
 						variant={isRecording ? "outline" : "default"}
-						disabled={isRecording || isModelBusy}
+						disabled={isCaptureBusy}
 						onClick={handleStartTranscription}
 					>
-						{isRecording ? "Recording..." : isModelBusy ? "Please wait..." : "Start"}
+						{isRecording
+							? "Recording..."
+							: isStartingCapture
+								? "Starting..."
+								: isModelBusy
+									? "Please wait..."
+									: "Start"}
 					</Button>
 					<Button
 						className="flex-1"
