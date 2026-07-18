@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,11 +8,32 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const root = resolve(__dirname, "..");
 export const profilePath = resolve(root, ".vscode/chrome-debug-profile");
 export const pidFile = join(profilePath, ".debug-chrome.pid");
-export const DEBUG_PORT = 9222;
+export const DEBUG_PORT = 9333;
 export const PROFILE_MARKER = "chrome-debug-profile";
 
 export function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function ensureDebugPortAvailable(port) {
+	return new Promise((resolvePromise, rejectPromise) => {
+		const server = createServer();
+		server.unref();
+		server.once("error", (error) => {
+			if (error.code === "EADDRINUSE") {
+				rejectPromise(
+					new Error(
+						`Chrome debug port ${port} is already in use. Stop the conflicting process or choose another port.`,
+					),
+				);
+				return;
+			}
+			rejectPromise(error);
+		});
+		server.listen(port, "127.0.0.1", () => {
+			server.close(resolvePromise);
+		});
+	});
 }
 
 /** Chrome on Windows misparses backslashes in flag values — always use forward slashes. */
@@ -93,7 +115,9 @@ export function waitForDebugPort(port, attempts = 80, delayMs = 250) {
 		const retry = () => {
 			tries += 1;
 			if (tries >= attempts) {
-				rejectPromise(new Error(`Chrome debug port ${port} did not become ready.`));
+				rejectPromise(
+					new Error(`Chrome debug port ${port} did not become ready.`),
+				);
 				return;
 			}
 			setTimeout(check, delayMs);
@@ -137,87 +161,8 @@ export async function waitForExtensionServiceWorker(
 	return null;
 }
 
-export async function sendBrowserCdpCommand(port, method, params = {}) {
-	const version = await fetch(`http://127.0.0.1:${port}/json/version`).then((response) => {
-		if (!response.ok) {
-			throw new Error(`CDP version check failed: ${response.status}`);
-		}
-		return response.json();
-	});
-
-	const wsUrl = version.webSocketDebuggerUrl;
-	if (!wsUrl) {
-		throw new Error("Chrome did not expose a WebSocket debugger URL.");
-	}
-
-	return new Promise((resolvePromise, rejectPromise) => {
-		const ws = new WebSocket(wsUrl);
-		const id = Math.floor(Math.random() * 1_000_000);
-		let settled = false;
-
-		const timeout = setTimeout(() => {
-			if (!settled) {
-				settled = true;
-				ws.close();
-				rejectPromise(new Error(`CDP timeout while calling ${method}`));
-			}
-		}, 30_000);
-
-		const finish = (error, result) => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			clearTimeout(timeout);
-			ws.close();
-			if (error) {
-				rejectPromise(error);
-				return;
-			}
-			resolvePromise(result);
-		};
-
-		ws.addEventListener("open", () => {
-			ws.send(JSON.stringify({ id, method, params }));
-		});
-
-		ws.addEventListener("message", (event) => {
-			try {
-				const parsed = JSON.parse(event.data.toString());
-				if (parsed.id !== id) {
-					return;
-				}
-				if (parsed.error) {
-					finish(new Error(parsed.error.message), undefined);
-					return;
-				}
-				finish(undefined, parsed.result);
-			} catch (error) {
-				finish(error instanceof Error ? error : new Error(String(error)), undefined);
-			}
-		});
-
-		ws.addEventListener("error", () => {
-			finish(new Error(`WebSocket error while calling ${method}`), undefined);
-		});
-	});
-}
-
-export async function reloadExtensionOnDebugPort(port, extensionPath) {
-	return sendBrowserCdpCommand(port, "Extensions.loadUnpacked", {
-		path: toChromeFlagPath(extensionPath),
-	});
-}
-
-export async function ensureExtensionReady(port, extensionPath) {
-	console.log("Reloading extension via CDP...");
-	const loadResult = await reloadExtensionOnDebugPort(port, extensionPath);
-	const extensionId = loadResult?.id;
-	if (!extensionId) {
-		throw new Error("Chrome did not return an extension id after reload.");
-	}
-
-	console.log(`Extension installed (id: ${extensionId}).`);
+export async function ensureExtensionReady(port, extensionId) {
+	console.log(`Checking extension startup (id: ${extensionId})...`);
 	const serviceWorker = await waitForExtensionServiceWorker(port, extensionId);
 	if (serviceWorker) {
 		await sleep(500);
@@ -228,5 +173,5 @@ export async function ensureExtensionReady(port, extensionPath) {
 		);
 	}
 
-	return loadResult;
+	return { id: extensionId };
 }
