@@ -103,32 +103,47 @@ async function readStorageEntries(): Promise<DebugEntry[]> {
 	}
 
 	return new Promise((resolve) => {
-		chrome.storage.local.get(STORAGE_KEY, (result) => {
-			const stored = result[STORAGE_KEY];
-			if (!Array.isArray(stored)) {
+		let settled = false;
+		const finish = (entries: DebugEntry[]) => {
+			if (settled) return;
+			settled = true;
+			resolve(entries);
+		};
+
+		// chrome.storage can hang while the extension context is cold after Chrome launch.
+		const timer = setTimeout(() => finish([]), 800);
+
+		try {
+			chrome.storage.local.get(STORAGE_KEY, (result) => {
+				clearTimeout(timer);
 				void chrome.runtime.lastError;
-				resolve([]);
-				return;
-			}
+				const stored = result?.[STORAGE_KEY];
+				if (!Array.isArray(stored)) {
+					finish([]);
+					return;
+				}
 
-			const normalized = stored
-				.filter((entry) => entry && typeof entry === "object")
-				.map((entry) => ({
-					ts: String((entry as DebugEntry).ts ?? ""),
-					level: ((entry as DebugEntry).level ?? "info") as DebugLevel,
-					scope: String((entry as DebugEntry).scope ?? "unknown"),
-					message: String((entry as DebugEntry).message ?? ""),
-					context: ((entry as DebugEntry).context ?? "inline") as DebugContext,
-					detail:
-						typeof (entry as DebugEntry).detail === "string"
-							? (entry as DebugEntry).detail
-							: undefined,
-				}))
-				.filter((entry) => entry.ts && entry.message);
+				const normalized = stored
+					.filter((entry) => entry && typeof entry === "object")
+					.map((entry) => ({
+						ts: String((entry as DebugEntry).ts ?? ""),
+						level: ((entry as DebugEntry).level ?? "info") as DebugLevel,
+						scope: String((entry as DebugEntry).scope ?? "unknown"),
+						message: String((entry as DebugEntry).message ?? ""),
+						context: ((entry as DebugEntry).context ?? "inline") as DebugContext,
+						detail:
+							typeof (entry as DebugEntry).detail === "string"
+								? (entry as DebugEntry).detail
+								: undefined,
+					}))
+					.filter((entry) => entry.ts && entry.message);
 
-			void chrome.runtime.lastError;
-			resolve(normalized);
-		});
+				finish(normalized);
+			});
+		} catch {
+			clearTimeout(timer);
+			finish([]);
+		}
 	});
 }
 

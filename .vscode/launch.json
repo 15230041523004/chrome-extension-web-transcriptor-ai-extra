@@ -6,9 +6,14 @@
       "type": "pwa-chrome",
       "request": "attach",
       "port": 9333,
-      "timeout": 60000,
+      "urlFilter": "chrome-extension://*/sidepanel.html",
+      "targetSelection": "automatic",
+      "disableNetworkCache": false,
+      "restart": true,
+      "timeout": 120000,
       "webRoot": "${workspaceFolder}",
       "preLaunchTask": "start chrome with extension",
+      "postDebugTask": "stop chrome debug",
       "resolveSourceMapLocations": [
         "${workspaceFolder}/**",
         "!**/node_modules/**"
@@ -20,9 +25,14 @@
       "type": "pwa-chrome",
       "request": "attach",
       "port": 9333,
-      "timeout": 60000,
+      "urlFilter": "chrome-extension://*/sidepanel.html",
+      "targetSelection": "automatic",
+      "disableNetworkCache": false,
+      "restart": true,
+      "timeout": 120000,
       "webRoot": "${workspaceFolder}",
       "preLaunchTask": "start chrome with extension (no build)",
+      "postDebugTask": "stop chrome debug",
       "resolveSourceMapLocations": [
         "${workspaceFolder}/**",
         "!**/node_modules/**"
@@ -34,9 +44,14 @@
       "type": "pwa-chrome",
       "request": "attach",
       "port": 9333,
-      "timeout": 60000,
+      "urlFilter": "chrome-extension://*/sidepanel.html",
+      "targetSelection": "automatic",
+      "disableNetworkCache": false,
+      "restart": true,
+      "timeout": 120000,
       "webRoot": "${workspaceFolder}",
       "preLaunchTask": "start chrome with extension (youtube)",
+      "postDebugTask": "stop chrome debug",
       "resolveSourceMapLocations": [
         "${workspaceFolder}/**",
         "!**/node_modules/**"

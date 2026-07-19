@@ -1,4 +1,8 @@
 import { killDebugChrome } from "./chrome-debug-utils.mjs";
 
-killDebugChrome();
-console.log("Debug Chrome processes stopped.");
+const result = await killDebugChrome();
+console.log(
+	result.graceful
+		? "Debug Chrome closed cleanly."
+		: "Debug Chrome processes stopped with fallback cleanup.",
+);

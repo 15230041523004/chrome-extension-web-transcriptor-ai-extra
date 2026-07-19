@@ -8,6 +8,7 @@ import {
 	ensureDebugPortAvailable,
 	ensureExtensionReady,
 	killDebugChrome,
+	normalizeDebugProfileExitState,
 	pidFile,
 	profilePath,
 	sleep,
@@ -26,6 +27,17 @@ function findChrome() {
 
 	const installations = ChromeLauncher.Launcher.getInstallations();
 	return installations[0];
+}
+
+function normalizeComparablePath(path) {
+	let normalized;
+	try {
+		normalized = realpathSync.native(path);
+	} catch {
+		normalized = resolve(path);
+	}
+	normalized = normalized.replaceAll("\\", "/");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 async function sendCdpCommandViaPipe(chromeInstance, method, params = {}) {
@@ -152,13 +164,20 @@ async function main() {
 	}
 	const extensionPath = realpathSync.native(distPath);
 
-	const url = process.argv[2] || "about:blank";
+	const url = process.argv[2] || "https://www.youtube.com";
 
 	mkdirSync(profilePath, { recursive: true });
-	killDebugChrome();
+	const previousChrome = await killDebugChrome();
+	if (previousChrome.graceful) {
+		console.log("Previous debug Chrome closed cleanly.");
+	}
+	if (normalizeDebugProfileExitState()) {
+		console.log("Repaired stale crash state in the dedicated debug profile.");
+	}
 	await ensureDebugPortAvailable(DEBUG_PORT);
 
 	console.log("Launching Chrome for debugging...");
+	console.log(`  Extension: ${extensionPath}`);
 	const chromeInstance = await launchDebugChrome(url, profilePath);
 
 	if (chromeInstance.pid) {
@@ -166,37 +185,57 @@ async function main() {
 	}
 
 	try {
-		console.log("Installing extension into the debug Chrome process...");
-		console.log(`  Extension: ${extensionPath}`);
-		const loadResult = await sendCdpCommandViaPipe(
-			chromeInstance,
-			"Extensions.loadUnpacked",
-			{ path: toChromeFlagPath(extensionPath) },
-		);
-		const extensionList = await sendCdpCommandViaPipe(
+		console.log("Checking unpacked extension via CDP...");
+		let extensionList = await sendCdpCommandViaPipe(
 			chromeInstance,
 			"Extensions.getExtensions",
 		);
-		const installedExtension = extensionList.extensions?.find(
-			(extension) => extension.id === loadResult.id && extension.enabled,
+		const comparableExtensionPath = normalizeComparablePath(extensionPath);
+		let installedExtension = extensionList.extensions?.find(
+			(extension) =>
+				extension.enabled &&
+				normalizeComparablePath(extension.path) === comparableExtensionPath,
 		);
-		if (!installedExtension) {
-			throw new Error(
-				`Chrome did not keep extension ${loadResult.id} enabled after installation.`,
+
+		let extensionId;
+		if (installedExtension) {
+			extensionId = installedExtension.id;
+			console.log(
+				"Reusing the unpacked extension restored by the debug profile.",
 			);
+		} else {
+			console.log("Installing unpacked extension via CDP...");
+			const loadResult = await sendCdpCommandViaPipe(
+				chromeInstance,
+				"Extensions.loadUnpacked",
+				{ path: toChromeFlagPath(extensionPath) },
+			);
+			extensionId = loadResult.id;
+			extensionList = await sendCdpCommandViaPipe(
+				chromeInstance,
+				"Extensions.getExtensions",
+			);
+			installedExtension = extensionList.extensions?.find(
+				(extension) => extension.id === extensionId && extension.enabled,
+			);
+			if (!installedExtension) {
+				throw new Error(
+					`Chrome did not keep extension ${extensionId} enabled after installation.`,
+				);
+			}
 		}
-		console.log(`Extension installed (id: ${loadResult.id}).`);
+		console.log(`Extension ready (id: ${extensionId}).`);
 
 		console.log("Waiting for Chrome debug port...");
 		await waitForDebugPort(DEBUG_PORT);
-		await sleep(1000);
+		await sleep(800);
 
-		await ensureExtensionReady(DEBUG_PORT, loadResult.id);
+		await ensureExtensionReady(DEBUG_PORT, extensionId);
 
 		console.log(`Chrome started (PID ${chromeInstance.pid ?? "unknown"}).`);
 		console.log(`Debugger port: ${DEBUG_PORT}`);
 		console.log(
-			"Open chrome://extensions — AI Transcriptior should be listed and enabled.",
+			"Open chrome://extensions - AI Transcriptior should be listed and enabled.",
 		);
 		console.log("To stop debug Chrome later, run: npm run stop:chrome");
 

@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,7 @@ export const profilePath = resolve(root, ".vscode/chrome-debug-profile");
 export const pidFile = join(profilePath, ".debug-chrome.pid");
 export const DEBUG_PORT = 9333;
 export const PROFILE_MARKER = "chrome-debug-profile";
+const GRACEFUL_CLOSE_TIMEOUT_MS = 5000;
 
 export function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,9 +84,105 @@ export function killChromeUsingDebugProfile() {
 	}
 }
 
-export function killDebugChrome() {
+async function waitForDebugPortToClose(
+	port,
+	timeoutMs = GRACEFUL_CLOSE_TIMEOUT_MS,
+) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			await fetch(`http://127.0.0.1:${port}/json/version`, {
+				signal: AbortSignal.timeout(300),
+			});
+		} catch {
+			return true;
+		}
+		await sleep(100);
+	}
+	return false;
+}
+
+async function closeChromeViaDebugPort(port) {
+	let version;
+	try {
+		const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+			signal: AbortSignal.timeout(1000),
+		});
+		if (!response.ok) {
+			return false;
+		}
+		version = await response.json();
+	} catch {
+		return false;
+	}
+
+	if (typeof version.webSocketDebuggerUrl !== "string") {
+		return false;
+	}
+
+	return new Promise((resolvePromise) => {
+		const requestId = Math.floor(Math.random() * 1_000_000);
+		let commandSent = false;
+		let settled = false;
+		const socket = new WebSocket(version.webSocketDebuggerUrl);
+		const timer = setTimeout(() => finish(false), GRACEFUL_CLOSE_TIMEOUT_MS);
+
+		const finish = (closed) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			try {
+				socket.close();
+			} catch {
+				// Browser may already have closed the socket.
+			}
+			resolvePromise(closed);
+		};
+
+		socket.addEventListener("open", () => {
+			commandSent = true;
+			socket.send(JSON.stringify({ id: requestId, method: "Browser.close" }));
+		});
+		socket.addEventListener("message", (event) => {
+			try {
+				const response = JSON.parse(String(event.data));
+				if (response.id === requestId) {
+					finish(!response.error);
+				}
+			} catch {
+				// Ignore unrelated or malformed CDP messages.
+			}
+		});
+		socket.addEventListener("close", () => finish(commandSent));
+		socket.addEventListener("error", () => finish(false));
+	});
+}
+
+/**
+ * Close the dedicated debug Chrome cleanly so its next run does not restore a
+ * crashed side-panel session. Force-kill is retained only as a last resort.
+ */
+export async function killDebugChrome() {
+	const storedPid = existsSync(pidFile)
+		? readFileSync(pidFile, "utf8").trim()
+		: null;
+	const gracefulCloseRequested = await closeChromeViaDebugPort(DEBUG_PORT);
+
+	if (gracefulCloseRequested && (await waitForDebugPortToClose(DEBUG_PORT))) {
+		// Give Chrome a final moment to flush profile state after releasing CDP.
+		await sleep(300);
+		try {
+			rmSync(pidFile);
+		} catch {
+			// Ignore cleanup errors.
+		}
+		return { graceful: true, forced: false };
+	}
+
 	if (existsSync(pidFile)) {
-		killProcessTree(readFileSync(pidFile, "utf8").trim());
+		killProcessTree(storedPid);
 		try {
 			rmSync(pidFile);
 		} catch {
@@ -94,6 +191,30 @@ export function killDebugChrome() {
 	}
 
 	killChromeUsingDebugProfile();
+	return { graceful: false, forced: true };
+}
+
+/**
+ * Repair only Chrome's crash marker in our dedicated debug profile. All tabs,
+ * extension storage, downloaded models, and other profile data are preserved.
+ */
+export function normalizeDebugProfileExitState() {
+	const preferencesPath = join(profilePath, "Default", "Preferences");
+	if (!existsSync(preferencesPath)) {
+		return false;
+	}
+
+	try {
+		const preferences = JSON.parse(readFileSync(preferencesPath, "utf8"));
+		if (preferences.profile?.exit_type !== "Crashed") {
+			return false;
+		}
+		preferences.profile.exit_type = "Normal";
+		writeFileSync(preferencesPath, JSON.stringify(preferences));
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export function waitForDebugPort(port, attempts = 80, delayMs = 250) {
@@ -165,7 +286,7 @@ export async function ensureExtensionReady(port, extensionId) {
 	console.log(`Checking extension startup (id: ${extensionId})...`);
 	const serviceWorker = await waitForExtensionServiceWorker(port, extensionId);
 	if (serviceWorker) {
-		await sleep(500);
+		await sleep(300);
 		console.log("Extension service worker is active.");
 	} else {
 		console.warn(
