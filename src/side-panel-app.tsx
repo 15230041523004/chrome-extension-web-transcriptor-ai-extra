@@ -8,6 +8,7 @@ import { useToast } from "./components/ui/use-toast";
 import { summarizeTranscription, summarizeWebPage } from "./summarizer";
 import { LanguageSelector } from "./components/LanguageSelector";
 import {
+	type SummarizationSource,
 	type TranscriptionLanguage,
 	transcriptionSettingsAtom,
 	TRANSLATE_TARGET_LANGUAGES as _TRANSLATE_TARGET_LANGUAGES,
@@ -21,7 +22,14 @@ import {
 	modelLoadingProgressAtom,
 	modelStatusAtom,
 } from "./jotai/modelStatusAtom";
-import { getAiSummarizationStatus } from "./lib/chromeAi";
+import {
+	type AiSummarizationStatus,
+	getAiSummarizationStatus,
+} from "./lib/chromeAi";
+import {
+	getLocalSummarizerState,
+	subscribeLocalSummarizerState,
+} from "./lib/localSummarizer";
 import { DebugPanel } from "./components/debug-panel";
 import { debugError, debugLog } from "./lib/debugLog";
 import { normalizeModelProgress } from "./lib/modelProgress";
@@ -33,10 +41,18 @@ const SidePanelApp: React.FC = () => {
 	const [summary, setSummary] = useState("");
 	const [transcriptionSettings, setTranscriptionSettings] = useAtom(transcriptionSettingsAtom);
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
-	const [aiStatus, setAiStatus] = useState({
-		available: false,
+	const [summarizationSource, setSummarizationSource] =
+		useState<SummarizationSource>("transcription");
+	const [aiStatus, setAiStatus] = useState<AiSummarizationStatus>({
+		available: true,
+		backend: "local",
 		downloading: false,
+		reason: "api-missing",
+		browserAiAvailable: false,
 	});
+	const [localSummarizerState, setLocalSummarizerState] = useState(
+		getLocalSummarizerState,
+	);
 	const [transcription, setTranscription] = useState("");
 	const [modelStatus, setModelStatus] = useAtom(modelStatusAtom);
 	const [loadingProgress, setLoadingProgress] = useAtom(modelLoadingProgressAtom);
@@ -123,13 +139,13 @@ const SidePanelApp: React.FC = () => {
 
 	useEffect(() => {
 		debugLog("side-panel-app", "useEffect mount");
+		const unsubscribeLocalSummarizer = subscribeLocalSummarizerState(
+			setLocalSummarizerState,
+		);
 		getAiSummarizationStatus()
 			.then((status) => {
 				debugLog("side-panel-app", "AI summarization status", status);
-				setAiStatus({
-					available: status.available,
-					downloading: status.downloading,
-				});
+				setAiStatus(status);
 			})
 			.catch((error) => {
 				debugError("side-panel-app", "getAiSummarizationStatus failed", error);
@@ -217,6 +233,7 @@ const SidePanelApp: React.FC = () => {
 			chrome.runtime.onMessage.removeListener(messageListener);
 			chrome.tabs.onActivated.removeListener(onTabActivated);
 			chrome.tabs.onUpdated.removeListener(onTabUpdated);
+			unsubscribeLocalSummarizer();
 		};
 	}, [setModelStatus, setLoadingProgress, setLoadedModelId]);
 
@@ -252,14 +269,13 @@ const SidePanelApp: React.FC = () => {
 	const { toast } = useToast();
 
 	const canSummarize =
-		transcriptionSettings.summarizationSource === "webpage" ||
-		transcription.trim().length > 0;
+		summarizationSource === "webpage" || transcription.trim().length > 0;
 
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
 			const result =
-				transcriptionSettings.summarizationSource === "transcription"
+				summarizationSource === "transcription"
 					? await summarizeTranscription(
 							transcription,
 							transcriptionSettings.summarizationLanguage,
@@ -341,38 +357,38 @@ const SidePanelApp: React.FC = () => {
 
 	const renderAiPanel = (fillHeight = false) => (
 		<div className={fillHeight ? "flex min-h-0 flex-1 flex-col px-2 py-2" : "px-2 py-2"}>
-			{!aiStatus.available ? (
-				<div className="text-center text-sm">
-					<p className="font-medium">AI Summarization is not available</p>
-					<p className="text-xs text-muted-foreground">
-						Use Chrome or Brave 138+ with on-device AI (Gemini Nano) enabled in browser settings.
-					</p>
-				</div>
-			) : (
-				<>
-					{aiStatus.downloading && (
-						<p className="mb-2 text-xs text-muted-foreground">
-							On-device AI model is downloading. The first summary may take longer.
-						</p>
-					)}
-					<AiSummarizer
-						language={transcriptionSettings.summarizationLanguage}
-						setLanguage={(language: TranscriptionLanguage) =>
-							setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
-						}
-						source={transcriptionSettings.summarizationSource}
-						setSource={(source) =>
-							setTranscriptionSettings((prev) => ({ ...prev, summarizationSource: source }))
-						}
-						isSummaryLoading={isSummaryLoading}
-						handleSummarize={handleSummarize}
-						summary={summary}
-						canSummarize={canSummarize && !isRecording && !isModelBusy}
-						hideTitle
-						fillHeight={fillHeight}
-					/>
-				</>
+			{(aiStatus.backend === "local" || localSummarizerState.status !== "idle") && (
+				<p className="mb-2 text-xs text-muted-foreground">
+					{localSummarizerState.status === "loading"
+						? `Downloading local on-device model${
+								localSummarizerState.progress > 0
+									? ` (${localSummarizerState.progress}%)`
+									: ""
+							}. The first summary may take longer.`
+						: "Using local on-device summarization. Brave does not expose Chrome's Gemini Nano APIs."}
+				</p>
 			)}
+			{aiStatus.backend !== "local" &&
+				localSummarizerState.status === "idle" &&
+				aiStatus.downloading && (
+					<p className="mb-2 text-xs text-muted-foreground">
+						Browser AI model is downloading. The first summary may take longer.
+					</p>
+				)}
+			<AiSummarizer
+				language={transcriptionSettings.summarizationLanguage}
+				setLanguage={(language: TranscriptionLanguage) =>
+					setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
+				}
+				source={summarizationSource}
+				setSource={setSummarizationSource}
+				isSummaryLoading={isSummaryLoading}
+				handleSummarize={handleSummarize}
+				summary={summary}
+				canSummarize={canSummarize && !isRecording && !isModelBusy}
+				hideTitle
+				fillHeight={fillHeight}
+			/>
 		</div>
 	);
 

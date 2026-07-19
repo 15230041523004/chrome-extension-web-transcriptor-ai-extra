@@ -40,7 +40,7 @@ export const AiSummarizer: React.FC<AiSummarizerProps> = ({
 			{!hideTitle && (
 				<div className="flex items-center justify-between gap-2">
 					<span className="text-sm font-medium">AI Summarization</span>
-					<span className="text-xs text-muted-foreground">Chrome/Brave on-device AI</span>
+					<span className="text-xs text-muted-foreground">On-device AI</span>
 				</div>
 			)}
 

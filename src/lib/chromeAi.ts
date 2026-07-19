@@ -1,11 +1,19 @@
 import { LANGUAGES, type TranscriptionLanguage } from "@/jotai/transcriptionSettings";
+import { getLocalSummarizerState, summarizeLocally } from "@/lib/localSummarizer";
 
-export type AiSummarizationBackend = "summarizer" | "languageModel" | "legacy" | "none";
+export type AiSummarizationBackend =
+	| "summarizer"
+	| "languageModel"
+	| "legacy"
+	| "local"
+	| "none";
 
 export type AiSummarizationStatus = {
 	available: boolean;
 	backend: AiSummarizationBackend;
 	downloading: boolean;
+	reason: "ready" | "downloading" | "api-missing" | "model-unavailable";
+	browserAiAvailable: boolean;
 };
 
 export type SummaryBackend = {
@@ -43,40 +51,64 @@ function getLanguageDisplayName(language: TranscriptionLanguage): string {
 		.join("/");
 }
 
+function getSummarizerApi(): typeof Summarizer | undefined {
+	return (globalThis as typeof globalThis & { Summarizer?: typeof Summarizer }).Summarizer;
+}
+
+function getLanguageModelApi(): typeof LanguageModel | undefined {
+	return (globalThis as typeof globalThis & { LanguageModel?: typeof LanguageModel }).LanguageModel;
+}
+
+function getLegacyAi(): typeof window.ai | undefined {
+	return (globalThis as typeof globalThis & { ai?: typeof window.ai }).ai;
+}
+
 async function checkSummarizerAvailability(): Promise<Availability | null> {
-	if (typeof Summarizer === "undefined") {
+	const summarizerApi = getSummarizerApi();
+	if (!summarizerApi) {
 		return null;
 	}
 
 	try {
-		return await Summarizer.availability({
-			type: "key-points",
-			format: "markdown",
-		});
+		return await summarizerApi.availability();
 	} catch {
-		return null;
+		try {
+			return await summarizerApi.availability({
+				type: "key-points",
+				format: "markdown",
+			});
+		} catch {
+			return null;
+		}
 	}
 }
 
 async function checkLanguageModelAvailability(): Promise<Availability | null> {
-	if (typeof LanguageModel === "undefined") {
+	const languageModelApi = getLanguageModelApi();
+	if (!languageModelApi) {
 		return null;
 	}
 
 	try {
-		return await LanguageModel.availability(LANGUAGE_MODEL_OPTIONS);
+		return await languageModelApi.availability();
 	} catch {
-		return null;
+		try {
+			return await languageModelApi.availability(LANGUAGE_MODEL_OPTIONS);
+		} catch {
+			return null;
+		}
 	}
 }
 
 async function checkLegacyAvailability(): Promise<boolean> {
-	if (!window.ai?.languageModel?.capabilities) {
+	const legacyAi = getLegacyAi();
+	if (!legacyAi?.assistant?.create) {
 		return false;
 	}
+	if (!legacyAi.languageModel?.capabilities) return true;
 
 	try {
-		const { available } = await window.ai.languageModel.capabilities();
+		const { available } = await legacyAi.languageModel.capabilities();
 		return available !== "no" && available !== "unavailable";
 	} catch {
 		return false;
@@ -90,6 +122,8 @@ export async function getAiSummarizationStatus(): Promise<AiSummarizationStatus>
 			available: true,
 			backend: "summarizer",
 			downloading: isDownloading(summarizerStatus),
+			reason: isDownloading(summarizerStatus) ? "downloading" : "ready",
+			browserAiAvailable: true,
 		};
 	}
 
@@ -99,6 +133,8 @@ export async function getAiSummarizationStatus(): Promise<AiSummarizationStatus>
 			available: true,
 			backend: "languageModel",
 			downloading: isDownloading(languageModelStatus),
+			reason: isDownloading(languageModelStatus) ? "downloading" : "ready",
+			browserAiAvailable: true,
 		};
 	}
 
@@ -107,19 +143,32 @@ export async function getAiSummarizationStatus(): Promise<AiSummarizationStatus>
 			available: true,
 			backend: "legacy",
 			downloading: false,
+			reason: "ready",
+			browserAiAvailable: true,
 		};
 	}
 
+	const localState = getLocalSummarizerState();
 	return {
-		available: false,
-		backend: "none",
-		downloading: false,
+		available: true,
+		backend: "local",
+		downloading: localState.status === "loading",
+		reason:
+			summarizerStatus === null && languageModelStatus === null
+				? "api-missing"
+				: "model-unavailable",
+		browserAiAvailable: false,
 	};
 }
 
 async function createSummarizerBackend(language: TranscriptionLanguage): Promise<SummaryBackend> {
+	const summarizerApi = getSummarizerApi();
+	if (!summarizerApi) {
+		throw new Error("Browser Summarizer API is not available.");
+	}
+
 	const bcp47 = toBcp47Language(language);
-	const summarizer = await Summarizer.create({
+	const summarizer = await summarizerApi.create({
 		type: "key-points",
 		format: "markdown",
 		outputLanguage: bcp47,
@@ -138,8 +187,13 @@ async function createLanguageModelBackend(
 	systemPrompt: string,
 	language: TranscriptionLanguage,
 ): Promise<SummaryBackend> {
+	const languageModelApi = getLanguageModelApi();
+	if (!languageModelApi) {
+		throw new Error("Browser Language Model API is not available.");
+	}
+
 	const bcp47 = toBcp47Language(language);
-	const session = await LanguageModel.create({
+	const session = await languageModelApi.create({
 		...LANGUAGE_MODEL_OPTIONS,
 		expectedInputs: [{ type: "text", languages: ["en", bcp47] }],
 		expectedOutputs: [{ type: "text", languages: [bcp47] }],
@@ -156,11 +210,12 @@ async function createLanguageModelBackend(
 }
 
 async function createLegacyBackend(systemPrompt: string): Promise<SummaryBackend> {
-	if (!window.ai?.assistant?.create) {
+	const legacyAi = getLegacyAi();
+	if (!legacyAi?.assistant?.create) {
 		throw new Error("Legacy Chrome AI is not available.");
 	}
 
-	const session = await window.ai.assistant.create({
+	const session = await legacyAi.assistant.create({
 		systemPrompt,
 		topK: 10,
 		temperature: 0,
@@ -175,21 +230,23 @@ async function createLegacyBackend(systemPrompt: string): Promise<SummaryBackend
 	};
 }
 
+function createLocalBackend(language: TranscriptionLanguage): SummaryBackend {
+	return {
+		backend: "local",
+		summarize: (prompt) => summarizeLocally(prompt, language),
+		destroy: () => undefined,
+	};
+}
+
 export async function createSummaryBackend(
 	systemPrompt: string,
 	language: TranscriptionLanguage,
 	preferredBackend?: AiSummarizationBackend,
 ): Promise<SummaryBackend> {
 	const status = await getAiSummarizationStatus();
-	if (!status.available) {
-		throw new Error(
-			"AI summarization is not available. Use Chrome/Brave 138+ with on-device AI (Gemini Nano) enabled.",
-		);
-	}
-
 	const backend = preferredBackend && preferredBackend !== "none" ? preferredBackend : status.backend;
 
-	if (backend === "summarizer" && typeof Summarizer !== "undefined") {
+	if (backend === "summarizer" && getSummarizerApi()) {
 		try {
 			return await createSummarizerBackend(language);
 		} catch (error) {
@@ -198,7 +255,7 @@ export async function createSummaryBackend(
 	}
 
 	if (backend === "languageModel" || backend === "summarizer") {
-		if (typeof LanguageModel !== "undefined") {
+		if (getLanguageModelApi()) {
 			try {
 				return await createLanguageModelBackend(systemPrompt, language);
 			} catch (error) {
@@ -207,13 +264,11 @@ export async function createSummaryBackend(
 		}
 	}
 
-	if (window.ai?.assistant?.create) {
+	if (getLegacyAi()?.assistant?.create) {
 		return createLegacyBackend(systemPrompt);
 	}
 
-	throw new Error(
-		"AI summarization is not available. Use Chrome/Brave 138+ with on-device AI (Gemini Nano) enabled.",
-	);
+	return createLocalBackend(language);
 }
 
 export async function translateSummaryText(
@@ -240,6 +295,9 @@ export async function translateSummaryText(
 	}
 }
 
-export function needsTranslation(backend: AiSummarizationBackend, language: TranscriptionLanguage): boolean {
-	return backend !== "summarizer" && language !== "english";
+export function needsTranslation(
+	backend: AiSummarizationBackend,
+	language: TranscriptionLanguage,
+): boolean {
+	return backend !== "summarizer" && backend !== "local" && language !== "english";
 }

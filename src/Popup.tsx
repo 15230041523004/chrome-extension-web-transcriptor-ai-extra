@@ -4,27 +4,44 @@ import { useAtom } from "jotai";
 import { AiSummarizer } from "./components/ai-summarizer";
 import { Textarea } from "./components/ui/textarea";
 import { useToast } from "./components/ui/use-toast";
-import { transcriptionSettingsAtom, type TranscriptionLanguage } from "./jotai/settingAtom";
-import { getAiSummarizationStatus } from "./lib/chromeAi";
+import {
+	type SummarizationSource,
+	transcriptionSettingsAtom,
+	type TranscriptionLanguage,
+} from "./jotai/settingAtom";
+import {
+	type AiSummarizationStatus,
+	getAiSummarizationStatus,
+} from "./lib/chromeAi";
+import {
+	getLocalSummarizerState,
+	subscribeLocalSummarizerState,
+} from "./lib/localSummarizer";
 import { summarizeTranscription, summarizeWebPage } from "./summarizer";
 
 const Popup: React.FC = () => {
 	const [summary, setSummary] = useState("");
 	const [transcriptionSettings, setTranscriptionSettings] = useAtom(transcriptionSettingsAtom);
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
-	const [aiStatus, setAiStatus] = useState({
-		available: false,
+	const [summarizationSource, setSummarizationSource] =
+		useState<SummarizationSource>("transcription");
+	const [aiStatus, setAiStatus] = useState<AiSummarizationStatus>({
+		available: true,
+		backend: "local",
 		downloading: false,
+		reason: "api-missing",
+		browserAiAvailable: false,
 	});
+	const [localSummarizerState, setLocalSummarizerState] = useState(
+		getLocalSummarizerState,
+	);
 	const [transcription, setTranscription] = useState("");
 
 	useEffect(() => {
-		getAiSummarizationStatus().then((status) => {
-			setAiStatus({
-				available: status.available,
-				downloading: status.downloading,
-			});
-		});
+		const unsubscribeLocalSummarizer = subscribeLocalSummarizerState(
+			setLocalSummarizerState,
+		);
+		getAiSummarizationStatus().then(setAiStatus);
 
 		const messageListener = (message: { type?: string; data?: { transcripted?: string } }) => {
 			if (message.type === "transcript") {
@@ -39,20 +56,22 @@ const Popup: React.FC = () => {
 		};
 
 		chrome.runtime.onMessage.addListener(messageListener);
-		return () => chrome.runtime.onMessage.removeListener(messageListener);
+		return () => {
+			chrome.runtime.onMessage.removeListener(messageListener);
+			unsubscribeLocalSummarizer();
+		};
 	}, []);
 
 	const { toast } = useToast();
 
 	const canSummarize =
-		transcriptionSettings.summarizationSource === "webpage" ||
-		transcription.trim().length > 0;
+		summarizationSource === "webpage" || transcription.trim().length > 0;
 
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
 			const result =
-				transcriptionSettings.summarizationSource === "transcription"
+				summarizationSource === "transcription"
 					? await summarizeTranscription(
 							transcription,
 							transcriptionSettings.summarizationLanguage,
@@ -85,39 +104,38 @@ const Popup: React.FC = () => {
 					</div>
 				</div>
 
-				{!aiStatus.available ? (
-					<div className="flex flex-col m-1 p-1">
-						<div className="text-center">
-							<h1>AI Summarization is not available</h1>
-							<p>
-								Use Chrome or Brave 138+ with on-device AI (Gemini Nano) enabled in browser
-								settings.
-							</p>
-						</div>
-					</div>
-				) : (
-					<div className="m-1 p-1">
-						{aiStatus.downloading && (
+				<div className="m-1 p-1">
+					{(aiStatus.backend === "local" || localSummarizerState.status !== "idle") && (
+						<p className="mb-2 text-xs text-muted-foreground">
+							{localSummarizerState.status === "loading"
+								? `Downloading local on-device model${
+										localSummarizerState.progress > 0
+											? ` (${localSummarizerState.progress}%)`
+											: ""
+									}. The first summary may take longer.`
+								: "Using local on-device summarization. Brave does not expose Chrome's Gemini Nano APIs."}
+						</p>
+					)}
+					{aiStatus.backend !== "local" &&
+						localSummarizerState.status === "idle" &&
+						aiStatus.downloading && (
 							<p className="mb-2 text-xs text-muted-foreground">
-								On-device AI model is downloading. The first summary may take longer.
+								Browser AI model is downloading. The first summary may take longer.
 							</p>
 						)}
-						<AiSummarizer
-							language={transcriptionSettings.summarizationLanguage}
-							setLanguage={(language: TranscriptionLanguage) =>
-								setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
-							}
-							source={transcriptionSettings.summarizationSource}
-							setSource={(source) =>
-								setTranscriptionSettings((prev) => ({ ...prev, summarizationSource: source }))
-							}
-							isSummaryLoading={isSummaryLoading}
-							handleSummarize={handleSummarize}
-							summary={summary}
-							canSummarize={canSummarize}
-						/>
-					</div>
-				)}
+					<AiSummarizer
+						language={transcriptionSettings.summarizationLanguage}
+						setLanguage={(language: TranscriptionLanguage) =>
+							setTranscriptionSettings((prev) => ({ ...prev, summarizationLanguage: language }))
+						}
+						source={summarizationSource}
+						setSource={setSummarizationSource}
+						isSummaryLoading={isSummaryLoading}
+						handleSummarize={handleSummarize}
+						summary={summary}
+						canSummarize={canSummarize}
+					/>
+				</div>
 			</div>
 		</div>
 	);
