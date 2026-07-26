@@ -11,7 +11,8 @@
   "compilerOptions": {
     "lib": ["dom", "ESNext"],
     "allowJs": true,
-    "baseUrl": ".",
+    "types": ["chrome"],
+    // paths are relative to this config file (baseUrl is deprecated in TypeScript 6+).
     "paths": {
       "@/*": ["./src/*"]
     }

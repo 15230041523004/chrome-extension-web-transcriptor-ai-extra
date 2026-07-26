@@ -1,5 +1,6 @@
 import { LANGUAGES, type TranscriptionLanguage } from "@/jotai/transcriptionSettings";
 import { getLocalSummarizerState, summarizeLocally } from "@/lib/localSummarizer";
+import { loadCloudAiSettings } from "@/lib/cloudAiSettings";
 
 export type AiSummarizationBackend =
 	| "summarizer"
@@ -152,7 +153,8 @@ export async function getAiSummarizationStatus(): Promise<AiSummarizationStatus>
 	return {
 		available: true,
 		backend: "local",
-		downloading: localState.status === "loading",
+		downloading:
+			localState.status === "loading" || localState.status === "summarizing",
 		reason:
 			summarizerStatus === null && languageModelStatus === null
 				? "api-missing"
@@ -233,7 +235,19 @@ async function createLegacyBackend(systemPrompt: string): Promise<SummaryBackend
 function createLocalBackend(language: TranscriptionLanguage): SummaryBackend {
 	return {
 		backend: "local",
-		summarize: (prompt) => summarizeLocally(prompt, language),
+		summarize: async (prompt) => {
+			const settings = await loadCloudAiSettings();
+			return summarizeLocally(prompt, language, {
+				localSummaryModel: settings.localSummaryModel,
+				summaryRatioTarget: settings.summaryRatioTarget,
+				summaryRatioMin: settings.summaryRatioMin,
+				summaryRatioMax: settings.summaryRatioMax,
+				chronoWindows: settings.chronoWindows,
+				maxBullets: settings.maxBullets,
+				minBullets: settings.minBullets,
+				maxBulletChars: settings.maxBulletChars,
+			});
+		},
 		destroy: () => undefined,
 	};
 }

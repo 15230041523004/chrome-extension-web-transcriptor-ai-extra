@@ -5,7 +5,12 @@ import { AiSummarizer } from "./components/ai-summarizer";
 import { Button } from "./components/ui/button";
 import { Textarea } from "./components/ui/textarea";
 import { useToast } from "./components/ui/use-toast";
-import { summarizeTranscription, summarizeWebPage } from "./summarizer";
+import {
+	isYouTubeWatchUrl,
+	summarizeTranscription,
+	summarizeVideoTranscript,
+	summarizeWebPage,
+} from "./summarizer";
 import { LanguageSelector } from "./components/LanguageSelector";
 import {
 	type SummarizationSource,
@@ -22,6 +27,7 @@ import {
 	modelLoadingProgressAtom,
 	modelStatusAtom,
 } from "./jotai/modelStatusAtom";
+import { getActiveBrowserTab, subscribeActiveBrowserTab } from "./lib/activeTab";
 import {
 	type AiSummarizationStatus,
 	getAiSummarizationStatus,
@@ -69,6 +75,20 @@ const SidePanelApp: React.FC = () => {
 
 	const selectPanel = (panel: ActivePanel) => {
 		setActivePanel((current) => (current === panel && panel !== "transcript" ? "transcript" : panel));
+		// Re-resolve the page tab when opening AI so YouTube is detected even if
+		// the first query ran while the side panel held focus.
+		if (panel === "ai") {
+			void getActiveBrowserTab().then((tab) => {
+				if (!tab) return;
+				setActiveTabId(tab.id);
+				setActiveTabUrl(tab.url);
+				debugLog("side-panel-app", "active browser tab on AI open", {
+					tabId: tab.id,
+					tabUrl: tab.url,
+					isYouTube: isYouTubeWatchUrl(tab.url),
+				});
+			});
+		}
 	};
 
 	const isCapturableUrl = (url: string | undefined): boolean => {
@@ -82,16 +102,6 @@ const SidePanelApp: React.FC = () => {
 			"devtools://",
 		];
 		return !blockedPrefixes.some((prefix) => url.startsWith(prefix));
-	};
-
-	const refreshActiveTab = () => {
-		chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-			const tab = tabs[0];
-			if (typeof tab?.id === "number") {
-				setActiveTabId(tab.id);
-				setActiveTabUrl(tab.url);
-			}
-		});
 	};
 
 	const handleStartTranscription = () => {
@@ -151,15 +161,27 @@ const SidePanelApp: React.FC = () => {
 				debugError("side-panel-app", "getAiSummarizationStatus failed", error);
 			});
 
-		refreshActiveTab();
-		const onTabActivated = () => refreshActiveTab();
-		const onTabUpdated = (_tabId: number, changeInfo: { url?: string; status?: string }) => {
-			if (changeInfo.url || changeInfo.status === "complete") {
-				refreshActiveTab();
+		let lastLoggedTabKey = "";
+		const unsubscribeActiveTab = subscribeActiveBrowserTab((tab) => {
+			if (!tab) {
+				if (lastLoggedTabKey !== "null") {
+					lastLoggedTabKey = "null";
+					debugLog("side-panel-app", "active browser tab unresolved");
+				}
+				return;
 			}
-		};
-		chrome.tabs.onActivated.addListener(onTabActivated);
-		chrome.tabs.onUpdated.addListener(onTabUpdated);
+			setActiveTabId(tab.id);
+			setActiveTabUrl(tab.url);
+			const key = `${tab.id}|${tab.url ?? ""}`;
+			if (key !== lastLoggedTabKey) {
+				lastLoggedTabKey = key;
+				debugLog("side-panel-app", "active browser tab", {
+					tabId: tab.id,
+					tabUrl: tab.url,
+					isYouTube: isYouTubeWatchUrl(tab.url),
+				});
+			}
+		});
 
 		chrome.runtime.sendMessage(
 			{ type: "get-recording-state" },
@@ -231,8 +253,7 @@ const SidePanelApp: React.FC = () => {
 		return () => {
 			debugLog("side-panel-app", "useEffect cleanup");
 			chrome.runtime.onMessage.removeListener(messageListener);
-			chrome.tabs.onActivated.removeListener(onTabActivated);
-			chrome.tabs.onUpdated.removeListener(onTabUpdated);
+			unsubscribeActiveTab();
 			unsubscribeLocalSummarizer();
 		};
 	}, [setModelStatus, setLoadingProgress, setLoadedModelId]);
@@ -268,19 +289,31 @@ const SidePanelApp: React.FC = () => {
 
 	const { toast } = useToast();
 
+	const isYouTubeTab = isYouTubeWatchUrl(activeTabUrl);
+
+	useEffect(() => {
+		if (!isYouTubeTab && summarizationSource === "videoTranscript") {
+			setSummarizationSource("transcription");
+		}
+	}, [isYouTubeTab, summarizationSource]);
+
 	const canSummarize =
-		summarizationSource === "webpage" || transcription.trim().length > 0;
+		summarizationSource === "webpage" ||
+		summarizationSource === "videoTranscript" ||
+		transcription.trim().length > 0;
 
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
-			const result =
-				summarizationSource === "transcription"
-					? await summarizeTranscription(
-							transcription,
-							transcriptionSettings.summarizationLanguage,
-						)
-					: await summarizeWebPage(transcriptionSettings.summarizationLanguage);
+			const language = transcriptionSettings.summarizationLanguage;
+			let result: string;
+			if (summarizationSource === "transcription") {
+				result = await summarizeTranscription(transcription, language);
+			} else if (summarizationSource === "videoTranscript") {
+				result = await summarizeVideoTranscript(language);
+			} else {
+				result = await summarizeWebPage(language);
+			}
 			setSummary(result);
 			toast({ description: "Summarized", color: "success" });
 		} catch (error) {
@@ -355,26 +388,39 @@ const SidePanelApp: React.FC = () => {
 		</section>
 	);
 
+	const localSummaryTooltip =
+		localSummarizerState.status === "loading"
+			? `${localSummarizerState.detail ?? "Downloading local summarization model"}${
+					localSummarizerState.progress > 0
+						? ` (${localSummarizerState.progress}%)`
+						: ""
+				}`
+			: localSummarizerState.status === "summarizing"
+				? `${localSummarizerState.detail ?? "Summarizing with local AI…"}${
+						localSummarizerState.progress > 0
+							? ` (${localSummarizerState.progress}%)`
+							: ""
+					}`
+				: localSummarizerState.status === "extractive"
+					? localSummarizerState.detail ?? "Using extractive TextRank fallback."
+					: aiStatus.downloading
+						? "Browser AI model is downloading. The first summary may take longer."
+						: "Local summary: DistilBART (EN), E5+LexRank (RU+), TextRank fallback.";
+
+	const summarizeDisabledReason = isRecording
+		? "Recording in progress. Stop recording before summarizing."
+		: isStartingCapture
+			? "Starting capture… Wait until recording begins or stops."
+			: isModelBusy
+				? "Please wait until the model finishes loading or processing."
+				: undefined;
+
+	const showCaptureFooter =
+		activePanel === "transcript" ||
+		(activePanel === "more" && secondaryView === "transcript");
+
 	const renderAiPanel = (fillHeight = false) => (
 		<div className={fillHeight ? "flex min-h-0 flex-1 flex-col px-2 py-2" : "px-2 py-2"}>
-			{(aiStatus.backend === "local" || localSummarizerState.status !== "idle") && (
-				<p className="mb-2 text-xs text-muted-foreground">
-					{localSummarizerState.status === "loading"
-						? `Downloading local on-device model${
-								localSummarizerState.progress > 0
-									? ` (${localSummarizerState.progress}%)`
-									: ""
-							}. The first summary may take longer.`
-						: "Using local on-device summarization. Brave does not expose Chrome's Gemini Nano APIs."}
-				</p>
-			)}
-			{aiStatus.backend !== "local" &&
-				localSummarizerState.status === "idle" &&
-				aiStatus.downloading && (
-					<p className="mb-2 text-xs text-muted-foreground">
-						Browser AI model is downloading. The first summary may take longer.
-					</p>
-				)}
 			<AiSummarizer
 				language={transcriptionSettings.summarizationLanguage}
 				setLanguage={(language: TranscriptionLanguage) =>
@@ -385,7 +431,10 @@ const SidePanelApp: React.FC = () => {
 				isSummaryLoading={isSummaryLoading}
 				handleSummarize={handleSummarize}
 				summary={summary}
-				canSummarize={canSummarize && !isRecording && !isModelBusy}
+				onClearSummary={() => setSummary("")}
+				canSummarize={canSummarize && !isRecording && !isModelBusy && !isStartingCapture}
+				summarizeDisabledReason={summarizeDisabledReason}
+				showVideoTranscriptSource={isYouTubeTab}
 				hideTitle
 				fillHeight={fillHeight}
 			/>
@@ -549,6 +598,7 @@ const SidePanelApp: React.FC = () => {
 					variant={activePanel === "ai" ? "default" : "outline"}
 					onClick={() => selectPanel("ai")}
 					className="h-auto gap-1.5 px-2 py-2 text-xs"
+					title={localSummaryTooltip}
 				>
 					<Sparkles className="h-4 w-4 shrink-0" aria-hidden="true" />
 					<span>Summary</span>
@@ -623,44 +673,57 @@ const SidePanelApp: React.FC = () => {
 				)}
 			</div>
 
-			<footer className="relative shrink-0 border-t border-border p-2 pb-0 pr-0">
-				<div className="space-y-2 pb-2 pr-2">
-				<div className="flex gap-2">
-					<Button
-						className="flex-1"
-						variant={isRecording ? "outline" : "default"}
-						disabled={isCaptureBusy}
-						onClick={handleStartTranscription}
-					>
-						{isRecording
-							? "Recording..."
-							: isStartingCapture
-								? "Starting..."
-								: isModelBusy
-									? "Please wait..."
-									: "Start"}
-					</Button>
-					<Button
-						className="flex-1"
-						variant={isRecording ? "destructive" : "outline"}
-						onClick={() => chrome.runtime.sendMessage({ type: "stop-transcription" })}
-					>
-						Stop
-					</Button>
-				</div>
-				<Button
-					className="w-full"
-					variant="outline"
-					onClick={() => {
-						navigator.clipboard.writeText(transcription);
-						toast({ description: "Copied to clipboard", color: "success", duration: 1000 });
-					}}
-				>
-					Copy to Clipboard
-				</Button>
-				</div>
-				<DebugPanel />
-			</footer>
+			{showCaptureFooter && (
+				<footer className="relative shrink-0 border-t border-border p-2 pb-0 pr-0">
+					<div className="space-y-2 pb-2 pr-2">
+						<div className="flex gap-2">
+							<Button
+								className="flex-1"
+								variant={isRecording ? "outline" : "default"}
+								disabled={isCaptureBusy}
+								onClick={handleStartTranscription}
+							>
+								{isRecording
+									? "Recording..."
+									: isStartingCapture
+										? "Starting..."
+										: isModelBusy
+											? "Please wait..."
+											: "Start"}
+							</Button>
+							<Button
+								className="flex-1"
+								variant={isRecording ? "destructive" : "outline"}
+								onClick={() =>
+									chrome.runtime.sendMessage({ type: "stop-transcription" })
+								}
+							>
+								Stop
+							</Button>
+						</div>
+						<Button
+							className="w-full"
+							variant="outline"
+							onClick={() => {
+								navigator.clipboard.writeText(transcription);
+								toast({
+									description: "Copied to clipboard",
+									color: "success",
+									duration: 1000,
+								});
+							}}
+						>
+							Copy to Clipboard
+						</Button>
+					</div>
+					<DebugPanel />
+				</footer>
+			)}
+			{!showCaptureFooter && (
+				<footer className="relative shrink-0 border-t border-border p-0">
+					<DebugPanel />
+				</footer>
+			)}
 		</div>
 	);
 };

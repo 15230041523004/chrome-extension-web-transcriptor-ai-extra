@@ -156,7 +156,10 @@ export type TranscriptionTask = "transcribe" | "translate";
 export type TranscriptionMode = "transcribe" | "translate";
 export const TRANSLATE_TARGET_LANGUAGES = ["english"] as const;
 export type TranslateTargetLanguage = (typeof TRANSLATE_TARGET_LANGUAGES)[number];
-export type SummarizationSource = "transcription" | "webpage";
+export type SummarizationSource =
+	| "transcription"
+	| "webpage"
+	| "videoTranscript";
 
 export type TranscriptionSettings = {
 	mode: TranscriptionMode;
@@ -206,7 +209,9 @@ function resolveTranscribeLanguage(
 }
 
 function resolveSummarizationSource(stored: Record<string, unknown>): SummarizationSource {
-	return stored.summarizationSource === "webpage" ? "webpage" : "transcription";
+	if (stored.summarizationSource === "webpage") return "webpage";
+	if (stored.summarizationSource === "videoTranscript") return "videoTranscript";
+	return "transcription";
 }
 
 function resolveStoredSettings(stored: Record<string, unknown>): Pick<

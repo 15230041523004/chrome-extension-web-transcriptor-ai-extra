@@ -22,7 +22,9 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "baseUrl": ".",
+    // Ensure Chrome extension APIs are always in the type graph (IDE + tsc).
+    "types": ["chrome", "vite/client"],
+    // paths are relative to this config file (baseUrl is deprecated in TypeScript 6+).
     "paths": {
       "@/*": ["./src/*"]
     }

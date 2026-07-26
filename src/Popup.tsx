@@ -9,15 +9,13 @@ import {
 	transcriptionSettingsAtom,
 	type TranscriptionLanguage,
 } from "./jotai/settingAtom";
+import { subscribeActiveBrowserTab } from "./lib/activeTab";
 import {
-	type AiSummarizationStatus,
-	getAiSummarizationStatus,
-} from "./lib/chromeAi";
-import {
-	getLocalSummarizerState,
-	subscribeLocalSummarizerState,
-} from "./lib/localSummarizer";
-import { summarizeTranscription, summarizeWebPage } from "./summarizer";
+	isYouTubeWatchUrl,
+	summarizeTranscription,
+	summarizeVideoTranscript,
+	summarizeWebPage,
+} from "./summarizer";
 
 const Popup: React.FC = () => {
 	const [summary, setSummary] = useState("");
@@ -25,23 +23,13 @@ const Popup: React.FC = () => {
 	const [isSummaryLoading, setIsSummaryLoading] = useState(false);
 	const [summarizationSource, setSummarizationSource] =
 		useState<SummarizationSource>("transcription");
-	const [aiStatus, setAiStatus] = useState<AiSummarizationStatus>({
-		available: true,
-		backend: "local",
-		downloading: false,
-		reason: "api-missing",
-		browserAiAvailable: false,
-	});
-	const [localSummarizerState, setLocalSummarizerState] = useState(
-		getLocalSummarizerState,
-	);
 	const [transcription, setTranscription] = useState("");
+	const [activeTabUrl, setActiveTabUrl] = useState<string | undefined>(undefined);
 
 	useEffect(() => {
-		const unsubscribeLocalSummarizer = subscribeLocalSummarizerState(
-			setLocalSummarizerState,
-		);
-		getAiSummarizationStatus().then(setAiStatus);
+		const unsubscribeActiveTab = subscribeActiveBrowserTab((tab) => {
+			setActiveTabUrl(tab?.url);
+		});
 
 		const messageListener = (message: { type?: string; data?: { transcripted?: string } }) => {
 			if (message.type === "transcript") {
@@ -58,25 +46,37 @@ const Popup: React.FC = () => {
 		chrome.runtime.onMessage.addListener(messageListener);
 		return () => {
 			chrome.runtime.onMessage.removeListener(messageListener);
-			unsubscribeLocalSummarizer();
+			unsubscribeActiveTab();
 		};
 	}, []);
 
 	const { toast } = useToast();
 
+	const isYouTubeTab = isYouTubeWatchUrl(activeTabUrl);
+
+	useEffect(() => {
+		if (!isYouTubeTab && summarizationSource === "videoTranscript") {
+			setSummarizationSource("transcription");
+		}
+	}, [isYouTubeTab, summarizationSource]);
+
 	const canSummarize =
-		summarizationSource === "webpage" || transcription.trim().length > 0;
+		summarizationSource === "webpage" ||
+		summarizationSource === "videoTranscript" ||
+		transcription.trim().length > 0;
 
 	const handleSummarize = async () => {
 		setIsSummaryLoading(true);
 		try {
-			const result =
-				summarizationSource === "transcription"
-					? await summarizeTranscription(
-							transcription,
-							transcriptionSettings.summarizationLanguage,
-						)
-					: await summarizeWebPage(transcriptionSettings.summarizationLanguage);
+			const language = transcriptionSettings.summarizationLanguage;
+			let result: string;
+			if (summarizationSource === "transcription") {
+				result = await summarizeTranscription(transcription, language);
+			} else if (summarizationSource === "videoTranscript") {
+				result = await summarizeVideoTranscript(language);
+			} else {
+				result = await summarizeWebPage(language);
+			}
 			setSummary(result);
 			toast({
 				description: "Summarized",
@@ -96,7 +96,7 @@ const Popup: React.FC = () => {
 
 	return (
 		<div className="container">
-			<div className="box-border h-auto w-[400px]">
+			<div className="box-border h-auto w-100">
 				<div className="flex flex-col m-1 p-1">
 					<div className="text-center">
 						<h1>Transcription</h1>
@@ -105,24 +105,6 @@ const Popup: React.FC = () => {
 				</div>
 
 				<div className="m-1 p-1">
-					{(aiStatus.backend === "local" || localSummarizerState.status !== "idle") && (
-						<p className="mb-2 text-xs text-muted-foreground">
-							{localSummarizerState.status === "loading"
-								? `Downloading local on-device model${
-										localSummarizerState.progress > 0
-											? ` (${localSummarizerState.progress}%)`
-											: ""
-									}. The first summary may take longer.`
-								: "Using local on-device summarization. Brave does not expose Chrome's Gemini Nano APIs."}
-						</p>
-					)}
-					{aiStatus.backend !== "local" &&
-						localSummarizerState.status === "idle" &&
-						aiStatus.downloading && (
-							<p className="mb-2 text-xs text-muted-foreground">
-								Browser AI model is downloading. The first summary may take longer.
-							</p>
-						)}
 					<AiSummarizer
 						language={transcriptionSettings.summarizationLanguage}
 						setLanguage={(language: TranscriptionLanguage) =>
@@ -133,7 +115,9 @@ const Popup: React.FC = () => {
 						isSummaryLoading={isSummaryLoading}
 						handleSummarize={handleSummarize}
 						summary={summary}
+						onClearSummary={() => setSummary("")}
 						canSummarize={canSummarize}
+						showVideoTranscriptSource={isYouTubeTab}
 					/>
 				</div>
 			</div>

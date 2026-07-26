@@ -1,4 +1,5 @@
 /// <reference types="vite/client" />
+/// <reference types="chrome" />
 /// <reference types="@types/dom-chromium-ai" />
 
 declare global {
